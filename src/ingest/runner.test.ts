@@ -1,14 +1,13 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isServiceError } from "../errors.js";
-import type { ContentItem } from "../model/contract.js";
 import { NotFound } from "../store/contract.js";
 import { SqliteStore } from "../store/sqlite.js";
 import { EXPECTED_SUBDIRS } from "./contract.js";
 import { n8nItemId } from "./parsers.js";
-import { ingestAll } from "./runner.js";
+import { ingestAll, WARNINGS_CAP } from "./runner.js";
 
 const tmpRoots: string[] = [];
 const stores: SqliteStore[] = [];
@@ -80,7 +79,7 @@ describe("ingestAll - the 5 roadmap GWTs", () => {
     await put(root, "state/drafts/d1.json", draft("d1", "draft"));
 
     const res = await ingestAll(store, root);
-    expect(res).toEqual({ items: 1, skipped: 0, warnings: [] });
+    expect(res).toEqual({ items: 1, skipped: 0, warnings: [], warnings_total: 0 });
 
     const item = store.getById(n8nItemId("d1"));
     expect(item.status).toBe("draft");
@@ -186,13 +185,17 @@ describe("ingestAll - the 5 roadmap GWTs", () => {
     );
 
     const res = await ingestAll(store, root);
-    expect(res.items).toBe(3); // draft + published + failed
-    expect(res.skipped).toBe(1);
-    expect(res.warnings).toHaveLength(1);
+    expect(res.items).toBe(2); // draft + published
+    expect(res.skipped).toBe(2); // corrupt line + failed attempt telemetry
+    expect(res.warnings).toHaveLength(2);
     expect(res.warnings[0]).toContain("logs/publish.jsonl:2");
+    expect(res.warnings[1]).toContain("logs/publish.jsonl:3");
+    expect(res.warnings[1]).toContain("publish attempt failed");
+    expect(res.warnings[1]).toContain("id=p2");
 
     expect(store.getById(n8nItemId("p1")).status).toBe("published");
-    expect(store.getById(n8nItemId("p2")).status).toBe("failed");
+    // a `failed` log line is per-attempt telemetry: it creates no item
+    expect(() => store.getById(n8nItemId("p2"))).toThrow(NotFound);
   });
 
   it("GWT-5: an empty mount root fail-closes with ingest_unmounted", async () => {
@@ -261,7 +264,7 @@ describe("ingestAll - queue directory status mapping", () => {
 });
 
 describe("ingestAll - publish_log statuses", () => {
-  it("failed keeps maybe_live in raw; operational statuses are skipped", async () => {
+  it("attempt telemetry (failed/retry-requeued/stuck-claim-recovered) is skipped + warned, never persisted", async () => {
     const root = await makeRoot();
     const store = memStore();
     await put(
@@ -308,17 +311,25 @@ describe("ingestAll - publish_log statuses", () => {
     );
 
     const res = await ingestAll(store, root);
-    expect(res.items).toBe(1);
-    expect(res.skipped).toBe(4);
-    expect(res.warnings).toEqual([]);
+    expect(res.items).toBe(0);
+    expect(res.skipped).toBe(5);
+    // the three attempt-telemetry lines each record one warning; the
+    // skipped queue event and the test traffic stay silent
+    expect(res.warnings).toHaveLength(3);
+    expect(res.warnings_total).toBe(3);
+    expect(res.warnings[0]).toContain("logs/publish.jsonl:1");
+    expect(res.warnings[0]).toContain("publish attempt failed");
+    expect(res.warnings[0]).toContain("id=f1");
+    expect(res.warnings[0]).toContain("maybe_live=true");
+    expect(res.warnings[1]).toContain("retry-requeued");
+    expect(res.warnings[2]).toContain("stuck-claim-recovered");
 
-    const item = store.getById(n8nItemId("f1")) as ContentItem & { raw?: unknown };
-    expect(item.status).toBe("failed");
-    expect((item.raw as Record<string, unknown>).maybe_live).toBe(true);
+    // a `failed` attempt is not a transition: no item is created
+    expect(() => store.getById(n8nItemId("f1"))).toThrow(NotFound);
     expect(() => store.getById(n8nItemId("tp1"))).toThrow(NotFound);
   });
 
-  it("derives upstream id from the `file` field when `id` is absent", async () => {
+  it("telemetry warnings carry the `file`-derived upstream id when `id` is absent", async () => {
     const root = await makeRoot();
     const store = memStore();
     await put(
@@ -333,8 +344,92 @@ describe("ingestAll - publish_log statuses", () => {
     );
 
     const res = await ingestAll(store, root);
+    expect(res.items).toBe(0);
+    expect(res.skipped).toBe(1);
+    expect(res.warnings).toHaveLength(1);
+    expect(res.warnings[0]).toContain("publish attempt failed");
+    expect(res.warnings[0]).toContain("id=f-noid-1793");
+    expect(() => store.getById(n8nItemId("f-noid-1793"))).toThrow(NotFound);
+  });
+
+  it("a failed -> retry-requeued -> published log sequence on one id ends in published", async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    await put(
+      root,
+      "logs/publish.jsonl",
+      [
+        logLine({
+          ts: "2026-10-28T03:00:00.000Z",
+          id: "seq1",
+          platform: "vk",
+          status: "failed",
+          error: "vk wall.post: token expired",
+        }),
+        logLine({
+          ts: "2026-10-28T03:40:56.433Z",
+          id: "seq1",
+          platform: "vk",
+          status: "retry-requeued",
+          retry: "1",
+        }),
+        logLine({
+          ts: "2026-10-28T04:05:00.000Z",
+          id: "seq1",
+          platform: "vk",
+          via: "vk api wall.post 29642349_310",
+          status: "published",
+        }),
+      ].join("\n"),
+    );
+
+    const res = await ingestAll(store, root);
     expect(res.items).toBe(1);
-    expect(store.getById(n8nItemId("f-noid-1793")).status).toBe("failed");
+    expect(res.skipped).toBe(2);
+    expect(res.warnings).toHaveLength(2);
+
+    const item = store.getById(n8nItemId("seq1"));
+    expect(item.status).toBe("published");
+    expect(item.published_urls).toEqual(["https://vk.com/wall29642349_310"]);
+    expect(item.timestamps.published_at).toBe("2026-10-28T04:05:00.000Z");
+  });
+
+  it("a published item is not regressed by a later failed log line", async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    await put(
+      root,
+      "logs/publish.jsonl",
+      [
+        logLine({
+          ts: "2026-10-28T06:00:00.000Z",
+          id: "reg1",
+          platform: "vk",
+          via: "vk api wall.post 29642349_311",
+          status: "published",
+        }),
+        // a retry attempt logged AFTER the publish (e.g. a mirrored
+        // second channel failing) must not touch the item's state
+        logLine({
+          ts: "2026-10-28T07:00:00.000Z",
+          id: "reg1",
+          platform: "vk",
+          status: "failed",
+          maybe_live: false,
+          error: "duplicate dispatch failed",
+        }),
+      ].join("\n"),
+    );
+
+    const res = await ingestAll(store, root);
+    expect(res.items).toBe(1);
+    expect(res.skipped).toBe(1);
+    expect(res.warnings).toHaveLength(1);
+    expect(res.warnings[0]).toContain("maybe_live=false");
+
+    const item = store.getById(n8nItemId("reg1"));
+    expect(item.status).toBe("published");
+    expect(item.timestamps.published_at).toBe("2026-10-28T06:00:00.000Z");
   });
 });
 
@@ -362,5 +457,78 @@ describe("ingestAll - corrupt records", () => {
     expect(res.items).toBe(0);
     expect(res.skipped).toBe(1);
     expect(res.warnings[0]).toContain("unknown platform");
+  });
+});
+
+describe("ingestAll - merge semantics", () => {
+  it("a curated objective survives re-ingest (default applies at creation only)", async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    await put(root, "state/drafts/d1.json", draft("d1", "pending"));
+
+    await ingestAll(store, root);
+    const created = store.getById(n8nItemId("d1"));
+    expect(created.objective).toBe("proof"); // creation default
+
+    // operator curation changes the pillar; re-ingesting the same
+    // upstream file must not clobber it back to the default
+    store.upsertContentItem({ ...created, objective: "authority" });
+    const res = await ingestAll(store, root);
+    expect(res.items).toBe(1);
+    expect(store.getById(n8nItemId("d1")).objective).toBe("authority");
+  });
+
+  it("a no-op re-ingest does not churn updated_at", async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    await put(root, "state/drafts/d1.json", draft("d1", "pending"));
+
+    await ingestAll(store, root, undefined, {
+      now: () => new Date("2026-11-01T00:00:00.000Z"),
+    });
+    const before = store.getById(n8nItemId("d1"));
+
+    const res = await ingestAll(store, root, undefined, {
+      now: () => new Date("2026-12-01T00:00:00.000Z"),
+    });
+    expect(res.items).toBe(1); // still counted as processed...
+
+    const after = store.getById(n8nItemId("d1"));
+    // ...but the merged row deep-equaled the stored one, so no write
+    expect(after).toEqual(before);
+    expect(after.timestamps.updated_at).toBe(before.timestamps.updated_at);
+  });
+});
+
+describe("ingestAll - filesystem scanning", () => {
+  it("a symlink inside a source dir is counted as skipped + warned", async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    await put(root, "state/drafts/real.json", draft("real", "pending"));
+    await symlink("missing-target.json", join(root, "state/drafts/link.json"));
+
+    const res = await ingestAll(store, root);
+    expect(res.items).toBe(1);
+    expect(res.skipped).toBe(1);
+    expect(res.warnings).toHaveLength(1);
+    expect(res.warnings[0]).toContain("state/drafts/link.json");
+    expect(res.warnings[0]).toContain("symlink");
+    expect(store.getById(n8nItemId("real")).status).toBe("moderation");
+  });
+});
+
+describe("ingestAll - warnings cap", () => {
+  it(`warnings are capped at ${WARNINGS_CAP} entries while warnings_total keeps counting`, async () => {
+    const root = await makeRoot();
+    const store = memStore();
+    const lines = Array.from({ length: WARNINGS_CAP + 50 }, (_, i) =>
+      logLine({ ts: "2026-10-28T08:00:00.000Z", id: `f-${i}`, status: "failed", error: "x" }),
+    );
+    await put(root, "logs/publish.jsonl", lines.join("\n"));
+
+    const res = await ingestAll(store, root);
+    expect(res.skipped).toBe(WARNINGS_CAP + 50);
+    expect(res.warnings).toHaveLength(WARNINGS_CAP);
+    expect(res.warnings_total).toBe(WARNINGS_CAP + 50);
   });
 });

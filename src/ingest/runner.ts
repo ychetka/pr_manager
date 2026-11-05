@@ -13,8 +13,11 @@
  * Bookkeeping fields the runner fills around the parser's partial:
  * - `source_kind`: the IngestSourceKind ("drafts" | "queue" |
  *   "publish_log").
- * - `objective`: upstream carries no pillar tag; deterministic default
- *   "proof". TODO(item_07): derive from BrandCharter once it lands.
+ * - `objective`: parsers omit it when it is not derivable; a NEW item
+ *   gets the deterministic default "proof", an EXISTING item keeps
+ *   whatever objective it already has (a curated value is never
+ *   clobbered by re-ingest). TODO(item_07): derive from BrandCharter
+ *   once it lands.
  * - `timestamps.updated_at`: ingest time; `created_at` keeps the
  *   upstream creation time when the parser supplies one.
  *
@@ -23,8 +26,23 @@
  * transitionStatus (published_at is set once, preferring the upstream
  * timestamp when the parser provides one); `platform_refs` and
  * `published_urls` merge as set-union so a later source enriches
- * rather than clobbers earlier data. A parse `null` counts as skipped;
+ * rather than clobbers earlier data. When the merged row deep-equals
+ * the stored one the write is skipped entirely - a no-op re-ingest
+ * does not churn `updated_at`. A parse `null` counts as skipped;
  * a throw counts as skipped + warning. Neither kills the pass.
+ *
+ * Publish-log attempt telemetry: `failed` / `retry-requeued` /
+ * `stuck-claim-recovered` lines are PER-ATTEMPT events (upstream
+ * retries; a failed line can be followed by retry-requeued and an
+ * eventual published on the same id). The parser returns null for
+ * them so they never drive a status transition; the runner re-reads
+ * such lines and records an IngestResult.warnings entry carrying
+ * id + status + maybe_live for operators. Terminal `failed` comes
+ * only from queue/publish/failed/*.json files.
+ *
+ * `IngestResult.warnings` is capped at {@link WARNINGS_CAP} entries;
+ * the pass keeps counting every warning in
+ * {@link IngestRunResult.warnings_total}.
  */
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
@@ -46,7 +64,7 @@ import {
   type ParseContext,
   type SourceParser,
 } from "./contract.js";
-import { PARSER_REGISTRY } from "./parsers.js";
+import { type IngestedContentItem, type IngestPartial, PARSER_REGISTRY } from "./parsers.js";
 
 export interface IngestOptions {
   /** Extra mount verification passed through to checkMountHealth. */
@@ -55,8 +73,47 @@ export interface IngestOptions {
   now?: () => Date;
 }
 
-/** Default objective for upstream records that carry no pillar tag. */
+/** Default objective for upstream records that carry no pillar tag (applied at creation only). */
 export const DEFAULT_INGEST_OBJECTIVE: ContentItem["objective"] = "proof";
+
+/**
+ * Hard cap on the `warnings` array of one ingest pass: a pathological
+ * mount (e.g. a corrupt JSONL stream) must not grow memory without
+ * bound. Every warning is still counted in
+ * {@link IngestRunResult.warnings_total}.
+ */
+export const WARNINGS_CAP = 200;
+
+/**
+ * Aggregate outcome of {@link ingestAll}: the contract
+ * {@link IngestResult} plus `warnings_total`, the number of warnings
+ * EMITTED this pass - `warnings` holds at most {@link WARNINGS_CAP}
+ * entries, so `warnings_total` is the field to monitor when the two
+ * diverge. (Non-contract extension of IngestResult: a superset, so the
+ * value still satisfies the contract interface.)
+ */
+export interface IngestRunResult extends IngestResult {
+  /** Total warnings emitted this pass (>= warnings.length). */
+  warnings_total: number;
+}
+
+/**
+ * Item shape built by the runner around a parser's partial: every
+ * ContentItem field except `objective`, which stays optional so the
+ * creation-vs-merge decision (default "proof" vs keep curated) can be
+ * made against the stored item.
+ */
+type IngestCandidate = Omit<IngestedContentItem, "objective"> & {
+  objective?: IngestedContentItem["objective"];
+};
+
+/** Append `msg` to the result warnings, honoring {@link WARNINGS_CAP}. */
+function warn(result: IngestRunResult, msg: string): void {
+  result.warnings_total += 1;
+  if (result.warnings.length < WARNINGS_CAP) {
+    result.warnings.push(msg);
+  }
+}
 
 interface RawRecord {
   raw: string;
@@ -74,18 +131,36 @@ function resolveParser(source: IngestSource): SourceParser {
   return parser;
 }
 
-async function listFiles(dir: string, ext: string): Promise<string[]> {
-  const out: string[] = [];
+interface ScanResult {
+  /** Regular files matching `ext`, sorted. */
+  files: string[];
+  /**
+   * Symlinked entries skipped by the scan: a Dirent's isFile()/isDirectory()
+   * do not follow links, so a symlinked *.json / *.jsonl / subdirectory
+   * would otherwise vanish without a trace. Callers count each as a
+   * skipped record + warning.
+   */
+  symlinks: string[];
+}
+
+async function listFiles(dir: string, ext: string): Promise<ScanResult> {
+  const files: string[] = [];
+  const symlinks: string[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
   for (const e of entries) {
     const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      out.push(...(await listFiles(p, ext)));
+    if (e.isSymbolicLink()) {
+      symlinks.push(p);
+    } else if (e.isDirectory()) {
+      const sub = await listFiles(p, ext);
+      files.push(...sub.files);
+      symlinks.push(...sub.symlinks);
     } else if (e.isFile() && e.name.endsWith(ext)) {
-      out.push(p);
+      files.push(p);
     }
   }
-  return out.sort();
+  files.sort();
+  return { files, symlinks };
 }
 
 /**
@@ -100,12 +175,27 @@ const LINE_FILE_FILTER: Partial<Record<IngestSource["kind"], RegExp>> = {
   publish_log: /^publish.*\.jsonl$/,
 };
 
-/** Slice a source directory into per-record inputs per INGEST_GRANULARITY. */
-async function* recordsOf(source: IngestSource, root: string): AsyncGenerator<RawRecord> {
+/**
+ * Slice a source directory into per-record inputs per INGEST_GRANULARITY.
+ * Skipped symlinks found while scanning are counted + warned into
+ * `result` (a symlinked file or tree must not vanish silently).
+ */
+async function* recordsOf(
+  source: IngestSource,
+  root: string,
+  result: IngestRunResult,
+): AsyncGenerator<RawRecord> {
   const dir = join(root, source.path);
   const granularity = INGEST_GRANULARITY[source.kind];
+  const ext = granularity === "file" ? ".json" : ".jsonl";
+  const scan = await listFiles(dir, ext);
+  for (const link of scan.symlinks) {
+    const rel = relative(root, link).split(sep).join("/");
+    result.skipped += 1;
+    warn(result, `${rel}: skipped symlink (not followed)`);
+  }
   if (granularity === "file") {
-    for (const file of await listFiles(dir, ".json")) {
+    for (const file of scan.files) {
       yield {
         raw: await readFile(file, "utf8"),
         ctx: { kind: source.kind, path: relative(root, file).split(sep).join("/") },
@@ -115,7 +205,7 @@ async function* recordsOf(source: IngestSource, root: string): AsyncGenerator<Ra
   }
   // line granularity: every line of every matching *.jsonl file is a record
   const filter = LINE_FILE_FILTER[source.kind] ?? /\.jsonl$/;
-  for (const file of await listFiles(dir, ".jsonl")) {
+  for (const file of scan.files) {
     const rel = relative(root, file).split(sep).join("/");
     if (!filter.test(basename(file))) {
       continue;
@@ -151,16 +241,16 @@ export async function ingestAll(
   root: string,
   sources: readonly IngestSource[] = DEFAULT_INGEST_SOURCES,
   opts: IngestOptions = {},
-): Promise<IngestResult> {
+): Promise<IngestRunResult> {
   await checkMountHealth(root, opts.mount);
 
   const now = opts.now?.() ?? new Date();
   const nowIso = now.toISOString();
-  const result: IngestResult = { items: 0, skipped: 0, warnings: [] };
+  const result: IngestRunResult = { items: 0, skipped: 0, warnings: [], warnings_total: 0 };
 
   for (const source of sources) {
     const parser = resolveParser(source);
-    for await (const { raw, ctx } of recordsOf(source, root)) {
+    for await (const { raw, ctx } of recordsOf(source, root, result)) {
       const outcome = parseRecord(parser, raw, ctx, result);
       if (outcome === null) {
         continue;
@@ -168,7 +258,7 @@ export async function ingestAll(
       const item = buildItem(outcome, source, nowIso);
       if (item === null) {
         result.skipped += 1;
-        result.warnings.push(`${locate(ctx)}: parser yielded no identity (id/external_id)`);
+        warn(result, `${locate(ctx)}: parser yielded no identity (id/external_id)`);
         continue;
       }
       try {
@@ -179,40 +269,96 @@ export async function ingestAll(
         // Conflict (idempotency-key claim by another id) are per-record
         // failures: warn + skip, never kill the pass.
         result.skipped += 1;
-        result.warnings.push(`${locate(ctx)}: ${describe(e)}`);
+        warn(result, `${locate(ctx)}: ${describe(e)}`);
       }
     }
   }
   return result;
 }
 
-/** Run the parser over one record; null/throw both mean "skipped". */
+/**
+ * Publish-log statuses that are PER-ATTEMPT telemetry, not pipeline
+ * transitions: upstream retries failed items, so a `failed` line on an
+ * id may be followed by `retry-requeued` and an eventual `published`.
+ * The parser skips them; the runner surfaces each as a warning so a
+ * failed attempt (and especially a `maybe_live` one) is visible to
+ * operators. Terminal `failed` is driven by queue/publish/failed/*.json.
+ */
+const ATTEMPT_TELEMETRY: ReadonlySet<string> = new Set([
+  "failed",
+  "retry-requeued",
+  "stuck-claim-recovered",
+]);
+
+/**
+ * When a publish_log line is parser-skipped, re-read it: if it is one
+ * of the {@link ATTEMPT_TELEMETRY} statuses, record a warning carrying
+ * the upstream id (`id`, falling back to the `file` basename like the
+ * parser), the status and the `maybe_live` flag when present.
+ */
+function recordAttemptTelemetry(raw: string, ctx: ParseContext, result: IngestRunResult): void {
+  let rec: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return;
+    }
+    rec = parsed as Record<string, unknown>;
+  } catch {
+    return; // corrupt lines already produce a parse warning; nothing more to extract
+  }
+  const status = rec.status;
+  if (typeof status !== "string" || !ATTEMPT_TELEMETRY.has(status)) {
+    return;
+  }
+  const id =
+    typeof rec.id === "string" && rec.id.trim() !== ""
+      ? rec.id
+      : typeof rec.file === "string" && rec.file.trim() !== ""
+        ? rec.file.replace(/\.json$/i, "")
+        : "?";
+  const maybeLive = "maybe_live" in rec ? ` maybe_live=${JSON.stringify(rec.maybe_live)}` : "";
+  warn(result, `${locate(ctx)}: publish attempt ${status} (id=${id}${maybeLive})`);
+}
+
+/**
+ * Run the parser over one record; null/throw both mean "skipped".
+ * A skipped publish_log record may still be attempt telemetry - see
+ * {@link recordAttemptTelemetry}.
+ */
 function parseRecord(
   parser: SourceParser,
   raw: string,
   ctx: ParseContext,
-  result: IngestResult,
-): (Partial<ContentItem> & { raw?: unknown }) | null {
+  result: IngestRunResult,
+): IngestPartial | null {
   try {
-    const out = parser(raw, ctx) as (Partial<ContentItem> & { raw?: unknown }) | null;
+    const out = parser(raw, ctx) as IngestPartial | null;
     if (out === null) {
       result.skipped += 1;
+      if (ctx.kind === "publish_log") {
+        recordAttemptTelemetry(raw, ctx, result);
+      }
       return null;
     }
     return out;
   } catch (e) {
     result.skipped += 1;
-    result.warnings.push(`${locate(ctx)}: ${describe(e)}`);
+    warn(result, `${locate(ctx)}: ${describe(e)}`);
     return null;
   }
 }
 
-/** Fill runner bookkeeping around the parser's partial into a candidate item. */
+/**
+ * Fill runner bookkeeping around the parser's partial into a candidate
+ * item. `objective` is left absent unless the parser derived one - the
+ * upsert decides between the creation default and the stored value.
+ */
 function buildItem(
-  out: Partial<ContentItem> & { raw?: unknown },
+  out: IngestPartial,
   source: IngestSource,
   nowIso: string,
-): (ContentItem & { raw?: unknown }) | null {
+): IngestCandidate | null {
   const id = out.id ?? out.external_id;
   if (id === undefined || id.trim() === "") {
     return null;
@@ -227,17 +373,19 @@ function buildItem(
   } else if (out.timestamps?.published_at !== undefined) {
     timestamps.published_at = out.timestamps.published_at;
   }
-  const item: ContentItem & { raw?: unknown } = {
+  const item: IngestCandidate = {
     id,
     source_kind: source.kind,
     status,
     platform_refs: out.platform_refs ?? [],
     published_urls: out.published_urls ?? [],
-    objective: out.objective ?? DEFAULT_INGEST_OBJECTIVE,
     timestamps,
   };
   if (out.external_id !== undefined) {
     item.external_id = out.external_id;
+  }
+  if (out.objective !== undefined) {
+    item.objective = out.objective;
   }
   if (out.raw !== undefined) {
     item.raw = out.raw;
@@ -246,16 +394,38 @@ function buildItem(
 }
 
 /**
+ * Semantic equality of two items, ignoring `timestamps.updated_at`
+ * (the ingest-pass stamp): used to skip writes a re-ingest would
+ * repeat verbatim so a no-op re-ingest is truly silent.
+ */
+function sameItem(a: IngestedContentItem, b: IngestedContentItem): boolean {
+  return (
+    a.id === b.id &&
+    a.source_kind === b.source_kind &&
+    (a.external_id ?? null) === (b.external_id ?? null) &&
+    a.status === b.status &&
+    a.objective === b.objective &&
+    JSON.stringify(a.platform_refs) === JSON.stringify(b.platform_refs) &&
+    JSON.stringify(a.published_urls) === JSON.stringify(b.published_urls) &&
+    a.timestamps.created_at === b.timestamps.created_at &&
+    (a.timestamps.published_at ?? null) === (b.timestamps.published_at ?? null) &&
+    (a.raw ?? null) === (b.raw ?? null)
+  );
+}
+
+/**
  * fetch -> transitionStatus -> upsert. On a re-encountered upstream id
  * the stored item is merged with the fresh parser output; the status
  * move is validated through transitionStatus so Illegal moves (stale
  * snapshot regressions, terminal escapes) surface as warnings.
+ *
+ * `objective` is applied only when the incoming record carries one:
+ * a new item falls back to {@link DEFAULT_INGEST_OBJECTIVE} at
+ * creation, an existing item keeps its (possibly curated) objective.
+ * When the merged row deep-equals the stored one the write is skipped -
+ * a no-op re-ingest must not churn `updated_at`.
  */
-function upsertMerged(
-  store: StateStore,
-  incoming: ContentItem & { raw?: unknown },
-  now: Date,
-): void {
+function upsertMerged(store: StateStore, incoming: IngestCandidate, now: Date): void {
   let existing: ContentItem | null = null;
   try {
     existing = store.getById(incoming.id);
@@ -268,7 +438,10 @@ function upsertMerged(
   }
 
   if (existing === null) {
-    store.upsertContentItem(incoming);
+    store.upsertContentItem({
+      ...incoming,
+      objective: incoming.objective ?? DEFAULT_INGEST_OBJECTIVE,
+    });
     return;
   }
 
@@ -277,7 +450,7 @@ function upsertMerged(
     transitionStatus(existing, incoming.status, now);
   }
 
-  const merged: ContentItem & { raw?: unknown } = {
+  const merged: IngestedContentItem = {
     ...existing,
     source_kind: incoming.source_kind,
     external_id: incoming.external_id ?? existing.external_id,
@@ -294,9 +467,12 @@ function upsertMerged(
           : existing.timestamps.published_at,
     },
   };
-  const upstream = incoming.raw ?? (existing as { raw?: unknown }).raw;
+  const upstream = incoming.raw ?? (existing as IngestedContentItem).raw;
   if (upstream !== undefined) {
     merged.raw = upstream;
+  }
+  if (sameItem(existing as IngestedContentItem, merged)) {
+    return; // truly silent no-op: nothing but updated_at would change
   }
   store.upsertContentItem(merged);
 }

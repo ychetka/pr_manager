@@ -14,15 +14,19 @@
  *   update whose `status` is not a legal move from the stored one under
  *   transitionStatus rules throws InvalidTransition and writes nothing.
  *   The ingester therefore MUST do fetch -> transitionStatus -> upsert.
- * - `raw` column: the store persists an optional `raw` field carried on
- *   the item (ingest-side extension, NOT part of the ContentItem
- *   contract - the upstream record, e.g. a publish_log line keeping its
- *   `maybe_live` flag). NULL when the item carries none; the payload is
- *   re-attached on reads so re-upserts keep it verbatim.
+ * - `raw` column: the store persists the optional `raw` string carried
+ *   on the item via the {@link IngestedContentItem} ingest extension
+ *   (the verbatim upstream record text, e.g. a publish_log line keeping
+ *   its `maybe_live` flag). NON-CONTRACT extension tracked as a
+ *   roadmap item_04 deviation: `raw` is not part of ContentItem and
+ *   other StateStore implementations may strip it. NULL when the item
+ *   carries none; the text is re-attached verbatim on reads so
+ *   re-upserts keep it.
  */
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
+import type { IngestedContentItem } from "../ingest/parsers.js";
 import { MIGRATIONS } from "../migrations/index.js";
 import {
   type ContentItem,
@@ -37,11 +41,6 @@ import {
   transitionStatus,
 } from "../model/contract.js";
 import { Conflict, idempotencyKey, NotFound, SCHEMA_VERSION, type StateStore } from "./contract.js";
-
-/** Upstream payload an ingester may attach to an item for the `raw` column. */
-export interface WithRaw {
-  raw?: unknown;
-}
 
 interface ItemRow {
   id: string;
@@ -115,7 +114,6 @@ export class SqliteStore implements StateStore {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
     this.db = new Database(dbPath);
-    this.db.pragma("foreign_keys = ON");
   }
 
   /** Close the underlying database handle. */
@@ -131,9 +129,20 @@ export class SqliteStore implements StateStore {
   /**
    * Apply every pending migration inside one transaction each and bump
    * `PRAGMA user_version`. Idempotent on an up-to-date database.
+   *
+   * @throws Error when the database's `user_version` is HIGHER than the
+   *   newest migration this code knows - the db was written by a newer
+   *   build and serving against it would silently misread the schema.
    */
   migrate(): void {
     const current = this.schemaVersion;
+    const maxKnown = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
+    if (current > maxKnown) {
+      throw new Error(
+        `database schema version ${current} is newer than this code supports ` +
+          `(latest migration ${maxKnown}); refusing to run against a downgraded build`,
+      );
+    }
     const pending = MIGRATIONS.filter((m) => m.version > current).sort(
       (a, b) => a.version - b.version,
     );
@@ -154,58 +163,72 @@ export class SqliteStore implements StateStore {
     const storedExternal =
       item.external_id === undefined || item.external_id.trim() === "" ? null : item.external_id;
 
-    const holder = this.db
-      .prepare("SELECT id FROM content_items WHERE source_kind = ? AND dedupe_key = ?")
-      .get(source_kind, external_id) as { id: string } | undefined;
-    if (holder !== undefined && holder.id !== item.id) {
-      throw new Conflict(source_kind, external_id);
-    }
+    try {
+      // Holder-check + guard + write run inside ONE transaction so a
+      // competing writer cannot claim the dedupe key between the check
+      // and the insert; a residual SQLITE_CONSTRAINT_UNIQUE (another
+      // process won the race) maps to the contract Conflict below.
+      this.db.transaction(() => {
+        const holder = this.db
+          .prepare("SELECT id FROM content_items WHERE source_kind = ? AND dedupe_key = ?")
+          .get(source_kind, external_id) as { id: string } | undefined;
+        if (holder !== undefined && holder.id !== item.id) {
+          throw new Conflict(source_kind, external_id);
+        }
 
-    const existing = this.db.prepare("SELECT * FROM content_items WHERE id = ?").get(item.id) as
-      | ItemRow
-      | undefined;
-    if (existing !== undefined && existing.status !== item.status) {
-      // Regression guard: the incoming status must be a legal move from
-      // the stored one. transitionStatus is invoked for the CHECK only;
-      // the item is still persisted as given below.
-      transitionStatus(rowToItem(existing), item.status);
-    }
+        const existing = this.db.prepare("SELECT * FROM content_items WHERE id = ?").get(item.id) as
+          | ItemRow
+          | undefined;
+        if (existing !== undefined && existing.status !== item.status) {
+          // Regression guard: the incoming status must be a legal move
+          // from the stored one. transitionStatus is invoked for the
+          // CHECK only; the item is still persisted as given below.
+          transitionStatus(rowToItem(existing), item.status);
+        }
 
-    const upstream = (item as WithRaw).raw;
-    const rawJson = upstream === undefined ? null : JSON.stringify(upstream);
-    this.db
-      .prepare(
-        `INSERT INTO content_items
-           (id, source_kind, external_id, dedupe_key, status, platform_refs, published_urls,
-            objective, created_at, updated_at, published_at, raw)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           source_kind = excluded.source_kind,
-           external_id = excluded.external_id,
-           dedupe_key = excluded.dedupe_key,
-           status = excluded.status,
-           platform_refs = excluded.platform_refs,
-           published_urls = excluded.published_urls,
-           objective = excluded.objective,
-           created_at = excluded.created_at,
-           updated_at = excluded.updated_at,
-           published_at = excluded.published_at,
-           raw = excluded.raw`,
-      )
-      .run(
-        item.id,
-        source_kind,
-        storedExternal,
-        external_id,
-        item.status,
-        JSON.stringify(item.platform_refs),
-        JSON.stringify(item.published_urls),
-        item.objective,
-        item.timestamps.created_at,
-        item.timestamps.updated_at,
-        item.timestamps.published_at ?? null,
-        rawJson,
-      );
+        // `raw` is the IngestedContentItem ingest extension (verbatim
+        // upstream text); stored only via that documented path.
+        const upstream = (item as IngestedContentItem).raw;
+        this.db
+          .prepare(
+            `INSERT INTO content_items
+               (id, source_kind, external_id, dedupe_key, status, platform_refs, published_urls,
+                objective, created_at, updated_at, published_at, raw)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               source_kind = excluded.source_kind,
+               external_id = excluded.external_id,
+               dedupe_key = excluded.dedupe_key,
+               status = excluded.status,
+               platform_refs = excluded.platform_refs,
+               published_urls = excluded.published_urls,
+               objective = excluded.objective,
+               created_at = excluded.created_at,
+               updated_at = excluded.updated_at,
+               published_at = excluded.published_at,
+               raw = excluded.raw`,
+          )
+          .run(
+            item.id,
+            source_kind,
+            storedExternal,
+            external_id,
+            item.status,
+            JSON.stringify(item.platform_refs),
+            JSON.stringify(item.published_urls),
+            item.objective,
+            item.timestamps.created_at,
+            item.timestamps.updated_at,
+            item.timestamps.published_at ?? null,
+            upstream ?? null,
+          );
+      })();
+    } catch (e) {
+      if (isUniqueViolation(e)) {
+        throw new Conflict(source_kind, external_id);
+      }
+      throw e;
+    }
     return item;
   }
 
@@ -333,6 +356,15 @@ export class SqliteStore implements StateStore {
   }
 }
 
+/** Structural check for better-sqlite3's unique-constraint violation (avoid a hard instanceof). */
+function isUniqueViolation(e: unknown): boolean {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    (e as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE"
+  );
+}
+
 function rowToItem(row: ItemRow): ContentItem {
   const timestamps: ContentTimestamps = {
     created_at: row.created_at,
@@ -341,7 +373,7 @@ function rowToItem(row: ItemRow): ContentItem {
   if (row.published_at !== null) {
     timestamps.published_at = row.published_at;
   }
-  const item: ContentItem & WithRaw = {
+  const item: IngestedContentItem = {
     id: row.id,
     source_kind: row.source_kind,
     status: row.status as ContentStatus,
@@ -354,7 +386,7 @@ function rowToItem(row: ItemRow): ContentItem {
     item.external_id = row.external_id;
   }
   if (row.raw !== null) {
-    item.raw = JSON.parse(row.raw);
+    item.raw = row.raw; // verbatim upstream text (IngestedContentItem extension)
   }
   return item;
 }

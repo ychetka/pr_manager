@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { IngestedContentItem } from "../ingest/parsers.js";
 import {
   type ContentItem,
   InvalidTransition,
@@ -78,6 +79,14 @@ describe("SqliteStore - schema migrations", () => {
     expect(s2.schemaVersion).toBe(SCHEMA_VERSION); // migrations already applied
     s2.migrate(); // no-op
     expect(s2.getById("persisted").status).toBe("draft");
+  });
+
+  it("refuses to migrate a database newer than the code (user_version > max migration)", () => {
+    const s = new SqliteStore(":memory:");
+    stores.push(s);
+    s.migrate();
+    s.db.pragma("user_version = 999");
+    expect(() => s.migrate()).toThrow(/newer than this code/);
   });
 
   it("creates the db file in a missing parent directory", async () => {
@@ -202,13 +211,14 @@ describe("SqliteStore - content items", () => {
     expect(store.getById("b").external_id).toBe("ext-1");
   });
 
-  it("stores and returns an attached upstream `raw` payload", () => {
+  it("stores and returns an attached upstream `raw` payload verbatim (ingest extension)", () => {
     const store = memStore();
-    const item = makeItem({ id: "r1" }) as ContentItem & { raw?: unknown };
-    item.raw = { maybe_live: true, error: "token expired" };
+    const rawText = '{"maybe_live":true,"error":"token expired"}';
+    const item: IngestedContentItem = { ...makeItem({ id: "r1" }), raw: rawText };
     store.upsertContentItem(item);
-    const read = store.getById("r1") as ContentItem & { raw?: unknown };
-    expect(read.raw).toEqual({ maybe_live: true, error: "token expired" });
+    const read = store.getById("r1") as IngestedContentItem;
+    expect(read.raw).toBe(rawText);
+    expect(JSON.parse(read.raw as string).maybe_live).toBe(true);
   });
 });
 

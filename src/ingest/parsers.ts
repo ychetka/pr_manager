@@ -17,19 +17,34 @@
  *   (retry chains), and the prefix documents that the key comes from
  *   the log, not an entity file. Re-ingest of the same line still
  *   dedupes on (publish_log, publish_log:<id>) + same item id.
- * - `objective`: upstream carries no pillar tag, so parsers set none;
- *   the runner defaults it (see runner.ts). TODO(item_07): derive from
+ * - `objective`: upstream carries no pillar tag, so parsers OMIT the
+ *   field entirely (a parser must only set it when derivable); the
+ *   runner defaults it at item creation and preserves a curated value
+ *   on merge (see runner.ts). TODO(item_07): derive from
  *   BrandCharter/topic keywords when the charter lands.
- * - Every parser attaches the parsed upstream record as `raw` (the
- *   ingest-side extension SqliteStore persists verbatim - e.g. a
- *   `failed` log line keeps its `maybe_live` flag there).
+ * - Every parser attaches the verbatim upstream record text as `raw`
+ *   (the {@link IngestedContentItem} extension SqliteStore persists -
+ *   e.g. a `failed` log line keeps its `maybe_live` flag there).
  */
 import { basename, dirname } from "node:path";
 import { type ContentItem, type ContentStatus, parsePlatform } from "../model/contract.js";
 import type { ParseContext, ParserName, SourceParser } from "./contract.js";
 
+/**
+ * ContentItem plus the ingest-side `raw` extension: the verbatim
+ * upstream record text (a file body or a publish_log line) that
+ * SqliteStore persists in its `raw` column, so upstream-only fields
+ * (e.g. a failed publish attempt's `maybe_live` flag) survive for
+ * operators and re-derivation.
+ *
+ * NON-CONTRACT extension, tracked as a roadmap item_04 deviation:
+ * `raw` is not part of ContentItem (src/model/contract.ts) and other
+ * StateStore implementations may strip it.
+ */
+export type IngestedContentItem = ContentItem & { raw?: string };
+
 /** Upstream payload carrier: an optional `raw` the store persists (see sqlite.ts). */
-export type IngestPartial = Partial<ContentItem> & { raw?: unknown };
+export type IngestPartial = Partial<ContentItem> & { raw?: string };
 
 /** Internal id shared by all n8n sources for one upstream entity. */
 export function n8nItemId(upstreamId: string): string {
@@ -108,7 +123,7 @@ export const n8nDraftsParser: SourceParser = (raw, ctx) => {
     status: DRAFT_STATUS[rec.status],
     platform_refs: platformRefs(rec),
     published_urls: [],
-    raw: rec,
+    raw,
   };
   const created = normTs(rec.created_at);
   if (created !== undefined) {
@@ -152,7 +167,7 @@ export const n8nQueueParser: SourceParser = (raw, ctx) => {
     status,
     platform_refs: platformRefs(rec),
     published_urls: [],
-    raw: rec,
+    raw,
   };
   const ts = normTs(rec.approved_at);
   if (ts !== undefined) {
@@ -178,16 +193,20 @@ const VK_WALL_POST = /wall\.post (\d+_\d+)/;
 /**
  * Publish-log status mapping:
  *   published -> published  (published_urls from `via` wall.post ref)
- *   failed    -> failed     (terminal; `maybe_live`/`error` kept in raw)
- *   skipped / retry-requeued / stuck-claim-recovered /
- *   test-published-deleted / anything else -> null (skip, info-level:
- *   these are operational events, not pipeline states - the queue
- *   directory already carries the item's real position).
+ *   failed / retry-requeued / stuck-claim-recovered -> null (skipped):
+ *     these are PER-ATTEMPT events, not pipeline transitions - upstream
+ *     retries failed items, so one id legitimately shows
+ *     failed -> retry-requeued -> published across lines. The runner
+ *     still surfaces each as an IngestResult.warnings entry carrying
+ *     id + status + maybe_live (see runner.ts). Terminal `failed` is
+ *     driven by queue/publish/failed/*.json files only.
+ *   skipped / test-published-deleted / anything else -> null (skipped
+ *   silently: queue events and test traffic carry no pipeline state -
+ *   the queue directory already has the item's real position).
  */
 export const n8nPublishLogParser: SourceParser = (raw, ctx) => {
   const rec = parseJsonObject(raw, ctx);
-  const status = rec.status;
-  if (status !== "published" && status !== "failed") {
+  if (rec.status !== "published") {
     return null;
   }
   // Identity: `id` wins; `file` (the queue filename) is the documented
@@ -204,12 +223,12 @@ export const n8nPublishLogParser: SourceParser = (raw, ctx) => {
   const out: IngestPartial = {
     id: n8nItemId(upstreamId),
     external_id: `publish_log:${upstreamId}`,
-    status: status as ContentStatus,
+    status: "published",
     platform_refs: platformRefs(rec),
     published_urls: [],
-    raw: rec,
+    raw,
   };
-  if (status === "published" && typeof rec.via === "string") {
+  if (typeof rec.via === "string") {
     const m = VK_WALL_POST.exec(rec.via);
     if (m !== null) {
       out.published_urls = [`https://vk.com/wall${m[1]}`];
@@ -217,14 +236,7 @@ export const n8nPublishLogParser: SourceParser = (raw, ctx) => {
   }
   const ts = normTs(rec.ts);
   if (ts !== undefined) {
-    const timestamps: NonNullable<IngestPartial["timestamps"]> = {
-      created_at: ts,
-      updated_at: ts,
-    };
-    if (status === "published") {
-      timestamps.published_at = ts;
-    }
-    out.timestamps = timestamps;
+    out.timestamps = { created_at: ts, updated_at: ts, published_at: ts };
   }
   return out;
 };
