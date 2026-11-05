@@ -25,6 +25,16 @@ export const TELEGRAM_API_BASE = "https://api.telegram.org";
 /** Default per-call timeout, ~10s per the roadmap. */
 export const DEFAULT_TELEGRAM_TIMEOUT_MS = 10_000;
 
+/**
+ * Telegram caps sendMessage text at 4096 chars; we truncate at 4000
+ * to keep a safety margin and append {@link TRUNCATED_SUFFIX} so the
+ * fact of truncation is visible in the delivered message.
+ */
+export const MAX_MESSAGE_CHARS = 4000;
+
+/** Marker appended to a truncated message text. */
+export const TRUNCATED_SUFFIX = "\n… [truncated]";
+
 /** One button of a Telegram inline keyboard row. */
 export interface InlineButton {
   text: string;
@@ -86,7 +96,12 @@ export async function sendMessage(
   const fetchImpl = opts.fetch ?? fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TELEGRAM_TIMEOUT_MS;
 
-  const payload: Record<string, unknown> = { chat_id: chatId, text };
+  const textCapped =
+    text.length > MAX_MESSAGE_CHARS
+      ? `${text.slice(0, MAX_MESSAGE_CHARS - TRUNCATED_SUFFIX.length)}${TRUNCATED_SUFFIX}`
+      : text;
+
+  const payload: Record<string, unknown> = { chat_id: chatId, text: textCapped };
   if (opts.inlineKeyboard !== undefined && opts.inlineKeyboard.length > 0) {
     payload.reply_markup = { inline_keyboard: opts.inlineKeyboard };
   }

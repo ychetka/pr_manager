@@ -8,7 +8,9 @@
  * button per recommended brief. Each brief is persisted as a
  * Recommendation (status "proposed"); the button's callback_data is
  * `pipeline:<rec_id>` so a callback handler can route it into
- * {@link sendToPipeline}.
+ * {@link sendToPipeline}. Consuming the callback_query update itself
+ * is wired in item_08 - this module owns the button payload and the
+ * entry point it routes to.
  *
  * {@link sendToPipeline} posts the recommendation back to the
  * shared_person intake - `POST {N8N_WEBHOOK_BASE}/webhook/content-gen`
@@ -40,6 +42,7 @@ import {
   PLATFORMS,
   type Platform,
   type Recommendation,
+  type RecommendationStatus,
 } from "../model/contract.js";
 import type { StateStore } from "../store/contract.js";
 import { sendMessage, type TelegramSendOptions } from "../telegram.js";
@@ -81,6 +84,8 @@ export interface DigestResult {
 export interface PipelineSendResult {
   ok: boolean;
   error?: string;
+  /** The rec's status at the gate, present when `error` is "invalid_status". */
+  status?: RecommendationStatus;
 }
 
 export interface RunDigestOptions {
@@ -300,7 +305,9 @@ export function recommendationId(nowIso: string, index: number): string {
 /**
  * Run one digest tick. Returns a {@link DigestResult} describing what
  * was sent and persisted; subsystem failures degrade or log instead
- * of throwing (see the module docstring).
+ * of throwing (see the module docstring). A store failure during
+ * stats gathering ends the tick early with `{sent:false, error}` -
+ * the digest dies gracefully, never throws.
  */
 export async function runDigest(
   store: StateStore,
@@ -310,7 +317,22 @@ export async function runDigest(
   const now = opts.now?.() ?? new Date();
   const nowIso = now.toISOString();
 
-  const stats = gatherStats(store, opts.metricsTopN ?? DEFAULT_METRICS_TOP_N);
+  let stats: PipelineStats;
+  try {
+    stats = gatherStats(store, opts.metricsTopN ?? DEFAULT_METRICS_TOP_N);
+  } catch (e) {
+    // Store failure: without the factual basis there is no digest to
+    // send - log and report the dead tick instead of throwing into it.
+    const err = causeMessage(e);
+    log(`[digest] stats gathering failed, skipping tick: ${err}`);
+    return {
+      sent: false,
+      llm_used: false,
+      briefs: 0,
+      recommendations: [],
+      error: `store: ${err}`,
+    };
+  }
   const rawDigest = formatRawDigest(stats, nowIso);
 
   let digestText = rawDigest;
@@ -410,9 +432,21 @@ export function serializeBriefContext(rec: Recommendation): string {
 
 /**
  * POST a stored recommendation to the shared_person content-gen
- * webhook and, on a 2xx, move it proposed -> sent. Any failure
- * (missing rec, transport error, non-2xx) is logged and returned as
- * `{ok:false,error}` with the recommendation untouched - never thrown.
+ * webhook and, on a 2xx, move it proposed -> sent.
+ *
+ * Dedupe/idempotency: only a rec whose CURRENT status is "proposed"
+ * may be ordered - a double-click or retry on a sent/dismissed rec
+ * returns `{ok:false, error:"invalid_status", status}` WITHOUT a
+ * network call, so a content-gen order is never duplicated. The
+ * single upfront read is fresh enough to gate on; the rec is
+ * re-fetched after the POST for the status flip.
+ *
+ * Any failure (missing rec, lookup error, transport error, non-2xx)
+ * is logged and returned as `{ok:false,error}` with the
+ * recommendation untouched - never thrown. A status-update failure
+ * AFTER a successful POST (InvalidTransition/NotFound, a store I/O
+ * error) is a logged "sent but status update failed" warning with
+ * `{ok:true}`: the order was honestly placed.
  */
 export async function sendToPipeline(
   store: StateStore,
@@ -421,16 +455,35 @@ export async function sendToPipeline(
 ): Promise<PipelineSendResult> {
   const log = opts.log ?? ((msg: string) => console.error(msg));
 
-  const rec = store.listRecommendations().find((r) => r.id === recId);
+  let rec: Recommendation | undefined;
+  try {
+    rec = store.listRecommendations().find((r) => r.id === recId);
+  } catch (e) {
+    const error = `recommendation lookup failed: ${causeMessage(e)}`;
+    log(`[digest] sendToPipeline ${recId}: ${error}`);
+    return { ok: false, error };
+  }
   if (rec === undefined) {
     const error = `recommendation not found: ${recId}`;
     log(`[digest] sendToPipeline skipped: ${error}`);
     return { ok: false, error };
   }
 
+  // Idempotency gate: anything but "proposed" means this rec was
+  // already ordered (sent/accepted) or closed out (dismissed) - do
+  // NOT fire another content-gen POST for it.
+  if (rec.status !== "proposed") {
+    const error = "invalid_status";
+    log(`[digest] sendToPipeline ${recId}: ${error} (status=${rec.status}), skipping POST`);
+    return { ok: false, error, status: rec.status };
+  }
+
+  const webhookBase = (
+    (opts.webhookBase ?? process.env[ENV_N8N_WEBHOOK_BASE])?.trim() || DEFAULT_N8N_WEBHOOK_BASE
+  ).replace(/\/+$/, "");
   const webhookUrl =
     (opts.webhookUrl ?? process.env[ENV_CONTENT_GEN_WEBHOOK_URL])?.trim() ||
-    `${(opts.webhookBase ?? process.env[ENV_N8N_WEBHOOK_BASE])?.trim() || DEFAULT_N8N_WEBHOOK_BASE}/webhook/content-gen`;
+    `${webhookBase}/webhook/content-gen`;
 
   const context = serializeBriefContext(rec);
   const payload = {
@@ -461,8 +514,25 @@ export async function sendToPipeline(
     return { ok: false, error };
   }
 
-  if (rec.status === "proposed") {
-    store.updateRecommendationStatus(rec.id, "sent");
+  // The POST already ordered the brief; the status flip below is
+  // bookkeeping and MUST NOT throw out of this non-throwing function.
+  // Re-fetch the rec fresh - it may have moved while the request was
+  // in flight - then flip proposed -> sent. A lifecycle/store failure
+  // (NotFound, InvalidTransition, I/O) degrades to a logged warning:
+  // `{ok:true}` is the honest outcome because the order was placed.
+  try {
+    const fresh = store.listRecommendations().find((r) => r.id === recId);
+    if (fresh === undefined) {
+      throw new Error("recommendation vanished after delivery");
+    }
+    if (fresh.status !== "sent") {
+      // "proposed" flips cleanly; a terminal status (accepted /
+      // dismissed) makes the store throw InvalidTransition, which is
+      // reported by the catch below as a post-send warning.
+      store.updateRecommendationStatus(recId, "sent");
+    }
+  } catch (e) {
+    log(`[digest] sendToPipeline ${recId}: sent but status update failed - ${causeMessage(e)}`);
   }
   log(`[digest] sendToPipeline ${recId}: brief delivered to ${webhookUrl}`);
   return { ok: true };
