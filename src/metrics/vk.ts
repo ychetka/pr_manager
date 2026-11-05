@@ -18,12 +18,18 @@
  * Error policy (VK `error.error_code`):
  * - 9 (rate/flood limit): retry the batch with exponential backoff
  *   (base {@link VkCollectorOptions.baseDelayMs}, x2 per retry) up to
- *   `maxRetries`; exhausted retries -> skip the batch's items + warn.
+ *   `maxRetries`; exhausted retries -> the batch's items land in
+ *   `errored` with code "metrics_upstream" (+ warn), so a fully
+ *   rate-limited run can never masquerade as a clean all-skipped one.
  * - 5 / 17 ({@link VK_AUTH_ERROR_CODES}): auth failures -> each item
  *   lands in the run's `errored` list with code "metrics_auth" (the v1
  *   metrics_error surrogate - see collector.ts), other batches continue.
  * - any other VK error -> warn + skip the batch's items, continue.
- * - network/HTTP/timeout/malformed-JSON failures -> `errored` entries
+ * - non-2xx HTTP: 401/403 -> `errored` with "metrics_auth" (broken or
+ *   insufficient credentials do not heal), any other status ->
+ *   `errored` with "metrics_upstream"; HTTP failures are never
+ *   retried, 4xx included.
+ * - network/timeout/malformed-JSON failures -> `errored` entries
  *   with code "metrics_upstream" (retryable per the error taxonomy),
  *   other batches continue.
  */
@@ -88,10 +94,16 @@ interface VkApiErrorBody {
   [key: string]: unknown;
 }
 
-/** Outcome of one wall.getById call (after the error-9 retry loop). */
+/**
+ * Outcome of one wall.getById call (after the error-9 retry loop).
+ * `vk_error.code` is the numeric VK error_code; `http_error.code` is
+ * the MetricsItemError code the outcome should carry ("metrics_auth"
+ * for 401/403, "metrics_upstream" otherwise).
+ */
 type BatchResult =
   | { kind: "ok"; posts: VkWallPost[] }
   | { kind: "vk_error"; code: number; message: string }
+  | { kind: "http_error"; code: string; message: string }
   | { kind: "upstream"; message: string };
 
 /**
@@ -197,7 +209,7 @@ export class VkCollector implements PlatformCollector {
         res?.kind === "ok"
           ? res.posts.find((p) => `${p.owner_id ?? ""}_${p.id ?? ""}` === ref)
           : undefined;
-      outcomes.push(outcomeFor(item.id, ref, res, apiPost, ctx.now));
+      outcomes.push(outcomeFor(item.id, ref, res, apiPost, ctx));
     }
     return outcomes;
   }
@@ -208,7 +220,7 @@ export class VkCollector implements PlatformCollector {
     if (value === undefined || value.trim() === "") {
       return undefined;
     }
-    return value;
+    return value.trim();
   }
 
   /**
@@ -230,7 +242,8 @@ export class VkCollector implements PlatformCollector {
       if (attempt >= this.maxRetries) {
         ctx.warn(
           `vk: wall.getById still rate-limited (error ${VK_ERROR_RATE_LIMIT}) ` +
-            `after ${this.maxRetries} retries - skipping ${posts.length} post(s)`,
+            `after ${this.maxRetries} retries - ${posts.length} post(s) ` +
+            "will be reported as errored",
         );
         return res;
       }
@@ -258,7 +271,14 @@ export class VkCollector implements PlatformCollector {
       return { kind: "upstream", message: `fetch failed: ${causeMessage(e)}` };
     }
     if (!res.ok) {
-      return { kind: "upstream", message: `HTTP ${res.status} ${res.statusText}` };
+      // 401/403 mean broken or insufficient credentials - a distinct,
+      // non-retryable auth failure; every other non-2xx is an upstream
+      // fault. Only VK error 9 is retried, so HTTP 4xx fails exactly once.
+      return {
+        kind: "http_error",
+        code: res.status === 401 || res.status === 403 ? METRICS_AUTH : METRICS_UPSTREAM,
+        message: `HTTP ${res.status} ${res.statusText}`,
+      };
     }
     let body: unknown;
     try {
@@ -290,7 +310,7 @@ function outcomeFor(
   ref: string,
   res: BatchResult | undefined,
   apiPost: VkWallPost | undefined,
-  now: () => Date,
+  ctx: CollectContext,
 ): CollectOutcome {
   if (res === undefined) {
     return { kind: "skip", item_id: itemId, reason: `post ${ref}: not requested` };
@@ -304,11 +324,31 @@ function outcomeFor(
         message: `vk error ${res.code}: ${res.message}`,
       };
     }
-    // Rate-limit exhausted and every other VK error: skip, don't fake metrics.
+    if (res.code === VK_ERROR_RATE_LIMIT) {
+      // wallGetById already exhausted its retries: a fully rate-limited
+      // run must surface in `errored`, not hide as a clean skip.
+      return {
+        kind: "error",
+        item_id: itemId,
+        code: METRICS_UPSTREAM,
+        message: `post ${ref}: vk error ${res.code}: ${res.message}`,
+      };
+    }
+    // Other VK errors are deliberate non-measurement (post deleted,
+    // wall access denied, ...): warn + skip, don't fake metrics.
+    ctx.warn(`vk: item ${itemId}: vk error ${res.code}: ${res.message} - skipped`);
     return {
       kind: "skip",
       item_id: itemId,
       reason: `vk error ${res.code}: ${res.message}`,
+    };
+  }
+  if (res.kind === "http_error") {
+    return {
+      kind: "error",
+      item_id: itemId,
+      code: res.code,
+      message: `post ${ref}: ${res.message}`,
     };
   }
   if (res.kind === "upstream") {
@@ -329,7 +369,7 @@ function outcomeFor(
   const snapshot: MetricSnapshot = {
     item_id: itemId,
     platform: "vk",
-    ts: now().toISOString(),
+    ts: ctx.now().toISOString(),
     raw: apiPost,
   };
   if (typeof apiPost.views?.count === "number") {

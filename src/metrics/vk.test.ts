@@ -155,7 +155,7 @@ describe("VkCollector", () => {
     expect(outcomes.filter((o) => o.kind === "metric")).toHaveLength(VK_BATCH_LIMIT + 1);
   });
 
-  it("retries VK error 9 with exponential backoff, then skips + warns when exhausted", async () => {
+  it("GWT-2: retries VK error 9 with exponential backoff, then errors + warns when exhausted", async () => {
     const warnings: string[] = [];
     const delays: number[] = [];
     const mock = mockFetch(() => ({ error: { error_code: 9, error_msg: "Flood control" } }));
@@ -173,11 +173,14 @@ describe("VkCollector", () => {
 
     expect(mock.calls).toHaveLength(4); // initial + 3 retries
     expect(delays).toEqual([1000, 2000, 4000]);
+    // Exhausted retries are a failed measurement, not a deliberate
+    // skip: a fully rate-limited run must surface in `errored`.
     expect(outcomes).toEqual([
       {
-        kind: "skip",
+        kind: "error",
         item_id: "item-1",
-        reason: "vk error 9: Flood control",
+        code: "metrics_upstream",
+        message: "post 29642349_300: vk error 9: Flood control",
       },
     ]);
     expect(warnings.some((w) => w.includes("rate-limited"))).toBe(true);
@@ -212,13 +215,15 @@ describe("VkCollector", () => {
     }
   });
 
-  it("skips items on other VK errors and keeps going", async () => {
+  it("warns + skips items on other VK errors and keeps going", async () => {
+    const warnings: string[] = [];
     const mock = mockFetch(() => ({ error: { error_code: 30, error_msg: "profile deleted" } }));
     const collector = new VkCollector({ token: "t", fetch: mock.fetch, sleep: noSleep });
-    const outcomes = await collector.collect([makeItem()], ctx());
+    const outcomes = await collector.collect([makeItem()], ctx(warnings));
     expect(outcomes).toEqual([
       { kind: "skip", item_id: "item-1", reason: "vk error 30: profile deleted" },
     ]);
+    expect(warnings.some((w) => w.includes("vk error 30"))).toBe(true);
   });
 
   it("reports fetch/HTTP failures as metrics_upstream errors", async () => {
@@ -241,6 +246,33 @@ describe("VkCollector", () => {
     if (o2[0]?.kind === "error") {
       expect(o2[0].code).toBe("metrics_upstream");
       expect(o2[0].message).toContain("HTTP 500");
+    }
+  });
+
+  it("classifies non-2xx HTTP by status (401/403 -> metrics_auth, rest -> metrics_upstream) and never retries", async () => {
+    const cases: Array<[number, string, string]> = [
+      [401, "Unauthorized", METRICS_AUTH],
+      [403, "Forbidden", METRICS_AUTH],
+      [429, "Too Many Requests", "metrics_upstream"],
+      [500, "Internal Server Error", "metrics_upstream"],
+    ];
+    for (const [status, statusText, code] of cases) {
+      let calls = 0;
+      const fetchImpl: FetchLike = () => {
+        calls += 1;
+        return Promise.resolve(new Response("x", { status, statusText }));
+      };
+      const collector = new VkCollector({ token: "t", fetch: fetchImpl, sleep: noSleep });
+      const outcomes = await collector.collect([makeItem()], ctx());
+      expect(calls).toBe(1); // non-2xx responses are never retried
+      expect(outcomes).toEqual([
+        {
+          kind: "error",
+          item_id: "item-1",
+          code,
+          message: `post 29642349_300: HTTP ${status} ${statusText}`,
+        },
+      ]);
     }
   });
 

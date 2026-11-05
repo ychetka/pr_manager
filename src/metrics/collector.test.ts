@@ -182,6 +182,48 @@ describe("collectMetrics", () => {
     expect(result.warnings.some((w) => w.includes("metrics_auth"))).toBe(true);
   });
 
+  it("GWT-2: a fully rate-limited run reports errored (metrics_upstream), not skipped", async () => {
+    const store = memStore();
+    store.upsertContentItem(makeItem());
+    const mock = mockFetch(() => ({ error: { error_code: 9, error_msg: "Flood control" } }));
+
+    const result = await collectMetrics(store, {
+      collectors: [vkCollector(mock.fetch)],
+      now: () => FIXED_NOW,
+    });
+
+    expect(result.collected).toBe(0);
+    expect(result.skipped).toEqual([]);
+    expect(result.errored).toEqual([
+      {
+        item_id: "item-1",
+        code: "metrics_upstream",
+        message: "post 29642349_300: vk error 9: Flood control",
+      },
+    ]);
+    expect(result.warnings.some((w) => w.includes("metrics_upstream"))).toBe(true);
+    expect(store.getById("item-1").status).toBe("published"); // retried next run
+  });
+
+  it("warns and ignores collector outcomes for items it never dispatched", async () => {
+    const store = memStore();
+    store.upsertContentItem(makeItem());
+    const rogue: PlatformCollector = {
+      platform: "vk",
+      collect: () =>
+        Promise.resolve([
+          { kind: "skip", item_id: "ghost", reason: "not dispatched" },
+          { kind: "skip", item_id: "item-1", reason: "deliberate" },
+        ]),
+    };
+
+    const result = await collectMetrics(store, { collectors: [rogue] });
+
+    expect(result.skipped).toEqual([{ item_id: "item-1", reason: "deliberate" }]);
+    expect(result.errored).toEqual([]);
+    expect(result.warnings.some((w) => w.includes("ghost"))).toBe(true);
+  });
+
   it("surfaces a missing VK_TOKEN as per-item metrics_auth errors, fetch untouched", async () => {
     vi.stubEnv("VK_TOKEN", "");
     const store = memStore();

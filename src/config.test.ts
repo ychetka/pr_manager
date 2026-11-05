@@ -44,6 +44,7 @@ describe("loadConfig", () => {
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m" }).vkToken).toBeUndefined();
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  " }).vkToken).toBeUndefined();
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "tok" }).vkToken).toBe("tok");
+    expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  tok  " }).vkToken).toBe("tok");
   });
 
   it("builds mountHealth options from env", () => {

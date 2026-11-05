@@ -82,7 +82,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
   };
   const vkToken = env[ENV_VK_TOKEN];
   if (vkToken !== undefined && vkToken.trim() !== "") {
-    cfg.vkToken = vkToken;
+    cfg.vkToken = vkToken.trim();
   }
   return cfg;
 }

@@ -66,8 +66,9 @@ export interface MetricsRunResult {
 /**
  * Per-item outcome a {@link PlatformCollector} reports back to the
  * runner. "metric" carries a ready-to-persist snapshot; "skip" and
- * "error" are the two non-success dispositions (skipped = nothing to
- * measure / upstream said no, error = the measurement itself failed).
+ * "error" are the two non-success dispositions (skipped = deliberate
+ * non-measurement - no collector, unparseable ref, item gone upstream;
+ * error = the measurement itself failed, e.g. exhausted retries).
  */
 export type CollectOutcome =
   | { kind: "metric"; item_id: string; snapshot: MetricSnapshot }
@@ -87,7 +88,8 @@ export interface CollectContext {
  * upstream specifics (endpoint, auth, batching, retries) and must
  * return one {@link CollectOutcome} per input item - extra outcomes
  * (e.g. one snapshot per post ref) are allowed; items missing from
- * the result are counted as skipped by the runner. A collector-level
+ * the result are counted as skipped by the runner, and outcomes whose
+ * item_id was never dispatched are warned and ignored. A collector-level
  * failure that prevents ANY measurement (e.g. missing credentials)
  * may instead throw, which the runner maps onto every item of that
  * platform without killing the rest of the run.
@@ -208,13 +210,21 @@ function applyOutcomes(
   result: MetricsRunResult,
   warn: (msg: string) => void,
 ): void {
+  const itemById = new Map(items.map((item) => [item.id, item] as const));
   const seen = new Set<string>();
   for (const outcome of outcomes) {
+    if (!itemById.has(outcome.item_id)) {
+      // An outcome for an item that was never dispatched is a
+      // collector bug: warn and ignore rather than fabricate a result
+      // row for an item the run does not own.
+      warn(`${platform}: outcome for unknown item ${outcome.item_id} ignored`);
+      continue;
+    }
     seen.add(outcome.item_id);
     if (outcome.kind === "metric") {
       store.recordMetric(outcome.snapshot);
       result.collected += 1;
-      markMeasured(store, items, outcome.item_id, ctx, warn);
+      markMeasured(store, itemById, outcome.item_id, ctx, warn);
     } else if (outcome.kind === "skip") {
       result.skipped.push({ item_id: outcome.item_id, reason: outcome.reason });
     } else {
@@ -242,12 +252,12 @@ function applyOutcomes(
  */
 function markMeasured(
   store: StateStore,
-  items: readonly ContentItem[],
+  itemById: ReadonlyMap<string, ContentItem>,
   itemId: string,
   ctx: CollectContext,
   warn: (msg: string) => void,
 ): void {
-  const item = items.find((i) => i.id === itemId);
+  const item = itemById.get(itemId);
   if (item === undefined || item.status !== "published") {
     return;
   }
