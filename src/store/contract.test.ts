@@ -13,6 +13,25 @@ import {
 import { Conflict, idempotencyKey, NotFound, SCHEMA_VERSION, type StateStore } from "./contract.js";
 
 /**
+ * Recommendation lifecycle edge-check shared by appendRecommendation
+ * (re-append = update) and updateRecommendationStatus:
+ * proposed -> sent -> accepted | dismissed; accepted/dismissed are
+ * terminal-ish (no outbound edges); same-status is a no-op; anything
+ * else throws InvalidTransition.
+ */
+function assertRecommendationEdge(from: RecommendationStatus, to: RecommendationStatus): void {
+  if (from === to) {
+    return;
+  }
+  const legal =
+    (from === "proposed" && to === "sent") ||
+    (from === "sent" && (to === "accepted" || to === "dismissed"));
+  if (!legal) {
+    throw new InvalidTransition(from, to);
+  }
+}
+
+/**
  * Minimal Map-based reference implementation of StateStore. Its only
  * purpose is to prove the contract is implementable and to pin the
  * behavioral rules (idempotent upsert, NotFound, metrics window,
@@ -88,6 +107,13 @@ class MemoryStore implements StateStore {
   }
 
   appendRecommendation(rec: Recommendation): void {
+    const existing = this.recommendations.get(rec.id);
+    if (existing !== undefined) {
+      // Re-append on an existing id is an update and must respect the
+      // lifecycle: a stale re-emit cannot regress accepted/dismissed
+      // back to proposed (same stale-snapshot class as the upsert guard).
+      assertRecommendationEdge(existing.status, rec.status);
+    }
     this.recommendations.set(rec.id, rec);
   }
 
@@ -105,14 +131,7 @@ class MemoryStore implements StateStore {
     if (rec.status === to) {
       return rec;
     }
-    // proposed -> sent -> accepted | dismissed; accepted/dismissed are
-    // terminal-ish (no outbound edges).
-    const legal =
-      (rec.status === "proposed" && to === "sent") ||
-      (rec.status === "sent" && (to === "accepted" || to === "dismissed"));
-    if (!legal) {
-      throw new InvalidTransition(rec.status, to);
-    }
+    assertRecommendationEdge(rec.status, to);
     const next = { ...rec, status: to };
     this.recommendations.set(id, next);
     return next;
@@ -193,6 +212,15 @@ describe("StateStore contract (MemoryStore reference impl)", () => {
     store.upsertContentItem(makeItem({ id: "a", external_id: "ext-9" }));
     store.upsertContentItem(makeItem({ id: "a", external_id: "ext-9", status: "approved" }));
     expect(store.getById("a").status).toBe("approved");
+  });
+
+  it("treats an empty/whitespace external_id as absent (falls back to id)", () => {
+    const store = new MemoryStore();
+    store.upsertContentItem(makeItem({ id: "a", external_id: "" }));
+    store.upsertContentItem(makeItem({ id: "b", external_id: "   " }));
+    // blank external ids are not dedupe keys, so no spurious Conflict
+    expect(store.rowCount()).toBe(2);
+    expect(idempotencyKey(makeItem({ id: "c", external_id: "  " })).external_id).toBe("c");
   });
 
   it("throws Conflict when a different id claims a taken (source_kind, external_id)", () => {
@@ -373,6 +401,31 @@ describe("StateStore contract (MemoryStore reference impl)", () => {
       const r = rec("r1", "proposed");
       store.appendRecommendation(r);
       expect(store.updateRecommendationStatus("r1", "proposed")).toBe(r);
+    });
+
+    it("rejects a re-append that regresses the recommendation lifecycle", () => {
+      const store = new MemoryStore();
+      store.appendRecommendation(rec("r1", "proposed"));
+      store.updateRecommendationStatus("r1", "sent");
+      store.updateRecommendationStatus("r1", "accepted");
+
+      // An emitter reusing a stable id must not regress accepted/dismissed
+      // back to proposed - same stale-snapshot class as the upsert guard.
+      expect(() => store.appendRecommendation(rec("r1", "proposed"))).toThrow(InvalidTransition);
+      expect(() => store.appendRecommendation(rec("r1", "dismissed"))).toThrow(InvalidTransition);
+      expect(store.listRecommendations("accepted")).toHaveLength(1);
+    });
+
+    it("allows a re-append with a legal forward move or identical status", () => {
+      const store = new MemoryStore();
+      store.appendRecommendation(rec("r1", "proposed"));
+
+      store.appendRecommendation(rec("r1", "sent")); // proposed -> sent is a legal edge
+      expect(store.listRecommendations("sent")).toHaveLength(1);
+
+      const revised = { ...rec("r1", "sent"), topic: "revised" };
+      store.appendRecommendation(revised); // same-status edge: no-op, record replaced
+      expect(store.listRecommendations("sent")).toEqual([revised]);
     });
 
     it("throws NotFound when updating a missing recommendation", () => {

@@ -60,14 +60,17 @@ export class Conflict extends Error {
 /**
  * Derives the idempotency key of a content item: the pair
  * (source_kind, external_id) where external_id defaults to item.id when
- * the item does not carry one. Implementations of
+ * the item does not carry a usable one - absent OR empty/whitespace-only
+ * (a blank external id is not a dedupe key and must not collide with
+ * other blank ids). Implementations of
  * {@link StateStore.upsertContentItem} must key deduplication on this.
  */
 export function idempotencyKey(item: ContentItem): {
   source_kind: string;
   external_id: string;
 } {
-  return { source_kind: item.source_kind, external_id: item.external_id ?? item.id };
+  const external_id = item.external_id?.trim();
+  return { source_kind: item.source_kind, external_id: external_id || item.id };
 }
 
 /**
@@ -144,10 +147,18 @@ export interface StateStore {
 
   /**
    * Persist a recommendation emitted by the digest/strategist loop,
-   * keyed by `rec.id`. A repeat append with an existing id replaces the
-   * stored record; status moves afterwards belong to
-   * {@link updateRecommendationStatus}. `rec.ts` must be a normalized
-   * UTC ISO-8601 timestamp.
+   * keyed by `rec.id`. `rec.ts` must be a normalized UTC ISO-8601
+   * timestamp.
+   *
+   * Appending on an EXISTING id is an update, not a fresh insert: it
+   * MUST respect the recommendation lifecycle (proposed -> sent ->
+   * accepted | dismissed; "accepted"/"dismissed" are terminal-ish; a
+   * same-status write is a no-op). An emitter reusing a stable id must
+   * not silently regress "accepted"/"dismissed" back to "proposed" -
+   * implementations SHOULD reject such a regression with
+   * `InvalidTransition` (recommended guard; the MemoryStore reference
+   * impl in contract.test.ts demonstrates it). Deliberate status
+   * changes still belong to {@link updateRecommendationStatus}.
    */
   appendRecommendation(rec: Recommendation): void;
 
