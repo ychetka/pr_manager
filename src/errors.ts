@@ -46,13 +46,20 @@ export type WellKnownCode = keyof typeof WELL_KNOWN_ERRORS;
 
 /**
  * The one error shape every subsystem throws or returns:
- * {code, subsystem, retryable, cause?}.
+ * {code, subsystem, retryable, detail?} plus a native `.cause`.
  *
  * - `code`: stable machine-readable identifier (a well-known code above
  *   or a subsystem-defined one).
  * - `subsystem`: origin subsystem, one of {@link SUBSYSTEMS}.
  * - `retryable`: whether retrying the same operation may succeed.
- * - `cause`: human-readable detail of the underlying failure.
+ * - `detail`: serialized, human-readable summary of the underlying
+ *   failure - the string that survives JSON round-trips across process
+ *   boundaries.
+ * - `cause`: the standard native Error slot carrying the STRUCTURED
+ *   original thrown value (kept via ErrorOptions when wrapping), so a
+ *   caller can still inspect upstream fields - e.g. an HTTP status to
+ *   tell a retryable 5xx from a fatal 4xx - that `detail` flattens
+ *   away. For a deserialized/foreign error `cause` may be absent.
  *
  * It extends Error so it can be thrown normally and still match the
  * documented data shape; {@link isServiceError} is a structural guard,
@@ -64,16 +71,18 @@ export class ServiceError extends Error {
     readonly code: string,
     readonly subsystem: Subsystem,
     readonly retryable: boolean,
-    cause?: string,
+    detail?: string,
+    options?: ErrorOptions,
   ) {
-    super(`[${subsystem}] ${code}${cause === undefined ? "" : `: ${cause}`}`);
+    super(`[${subsystem}] ${code}${detail === undefined ? "" : `: ${detail}`}`, options);
     this.name = "ServiceError";
-    if (cause !== undefined) {
-      this.cause = cause;
+    if (detail !== undefined) {
+      this.detail = detail;
     }
   }
 
-  declare cause?: string;
+  /** Serialized human-readable summary; the structured original is `.cause`. */
+  readonly detail?: string;
 }
 
 /** Extract a human-readable cause string from an unknown thrown value. */
@@ -92,42 +101,43 @@ export function makeError(
   code: string,
   subsystem: Subsystem,
   retryable: boolean,
-  cause?: string,
+  detail?: string,
 ): ServiceError {
-  return new ServiceError(code, subsystem, retryable, cause);
+  return new ServiceError(code, subsystem, retryable, detail);
 }
 
 /**
  * Construct a {@link ServiceError} for a well-known code, taking its
  * canonical subsystem and retryable flag from {@link WELL_KNOWN_ERRORS}.
  */
-export function wellKnown(code: WellKnownCode, cause?: string): ServiceError {
+export function wellKnown(code: WellKnownCode, detail?: string): ServiceError {
   const { subsystem, retryable } = WELL_KNOWN_ERRORS[code];
-  return new ServiceError(code, subsystem, retryable, cause);
+  return new ServiceError(code, subsystem, retryable, detail);
 }
 
 /**
  * Structural type guard for the service error shape. Deliberately not
  * `instanceof`: errors may arrive as plain objects across boundaries, so
- * the guard checks the documented fields (and validates `subsystem`
- * against {@link SUBSYSTEMS}).
+ * the guard checks the documented serialized fields (and validates
+ * `subsystem` against {@link SUBSYSTEMS}). The native `.cause` slot is
+ * intentionally unchecked - it holds the original value of any type.
  */
 export function isServiceError(e: unknown): e is ServiceError {
   if (typeof e !== "object" || e === null) {
     return false;
   }
-  const { code, subsystem, retryable, cause } = e as {
+  const { code, subsystem, retryable, detail } = e as {
     code?: unknown;
     subsystem?: unknown;
     retryable?: unknown;
-    cause?: unknown;
+    detail?: unknown;
   };
   return (
     typeof code === "string" &&
     typeof subsystem === "string" &&
     (SUBSYSTEMS as readonly string[]).includes(subsystem) &&
     typeof retryable === "boolean" &&
-    (cause === undefined || typeof cause === "string")
+    (detail === undefined || typeof detail === "string")
   );
 }
 
@@ -138,22 +148,28 @@ export function isServiceError(e: unknown): e is ServiceError {
  * its OWN classification - the origin subsystem knows best, so a
  * `metrics_upstream` thrown deep inside the metrics client must not be
  * relabeled by a caller passing different parameters. Otherwise the
- * caller-supplied (subsystem, code, retryable) classification is used
- * and the original message becomes `cause`.
+ * caller-supplied `opts` classification is used; `opts.retryable` is
+ * explicit-by-caller - the wrapper never guesses transience.
+ *
+ * Whatever was thrown is preserved verbatim on the native `.cause` slot
+ * (and summarized into {@link ServiceError.detail}), so callers can
+ * still inspect structured upstream fields - e.g. an HTTP status to
+ * distinguish a retryable 5xx from a fatal 4xx.
  */
 export function wrapError(
   e: unknown,
-  subsystem: Subsystem,
-  code: string,
-  retryable: boolean,
+  opts: { subsystem: Subsystem; code: string; retryable: boolean },
 ): ServiceError {
   if (e instanceof ServiceError) {
     return e;
   }
   if (isServiceError(e)) {
     // Plain shape-conforming object: re-emit as a real ServiceError,
-    // keeping its own classification (see docstring).
-    return new ServiceError(e.code, e.subsystem, e.retryable, e.cause);
+    // keeping its own classification (see docstring); the observed
+    // object itself becomes the native cause.
+    return new ServiceError(e.code, e.subsystem, e.retryable, e.detail, { cause: e });
   }
-  return new ServiceError(code, subsystem, retryable, causeMessage(e));
+  return new ServiceError(opts.code, opts.subsystem, opts.retryable, causeMessage(e), {
+    cause: e,
+  });
 }

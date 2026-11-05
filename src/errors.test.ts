@@ -16,7 +16,7 @@ import {
 } from "./errors.js";
 
 describe("ServiceError shape", () => {
-  it("makeError produces the documented {code, subsystem, retryable, cause} shape", () => {
+  it("makeError produces the documented {code, subsystem, retryable, detail} shape", () => {
     const err = makeError("custom_code", "digest", true, "boom");
 
     expect(err).toBeInstanceOf(ServiceError);
@@ -24,7 +24,8 @@ describe("ServiceError shape", () => {
     expect(err.code).toBe("custom_code");
     expect(err.subsystem).toBe("digest");
     expect(err.retryable).toBe(true);
-    expect(err.cause).toBe("boom");
+    expect(err.detail).toBe("boom");
+    expect(err.cause).toBeUndefined(); // native slot: nothing wrapped
     expect(err.message).toContain("custom_code");
     expect(err.message).toContain("boom");
   });
@@ -50,7 +51,7 @@ describe("ServiceError shape", () => {
       expect(err.code).toBe(code);
       expect(err.subsystem).toBe(subsystem);
       expect(err.retryable).toBe(retryable);
-      expect(err.cause).toBe("detail");
+      expect(err.detail).toBe("detail");
     }
   });
 });
@@ -62,10 +63,14 @@ describe("isServiceError", () => {
   });
 
   it("accepts a plain object carrying the shape", () => {
-    expect(isServiceError({ code: "c", subsystem: "metrics", retryable: true, cause: "why" })).toBe(
+    expect(
+      isServiceError({ code: "c", subsystem: "metrics", retryable: true, detail: "why" }),
+    ).toBe(true);
+    expect(isServiceError({ code: "c", subsystem: "ingest", retryable: false })).toBe(true);
+    // native .cause carries a value of ANY type - the guard does not constrain it
+    expect(isServiceError({ code: "c", subsystem: "ingest", retryable: false, cause: 3 })).toBe(
       true,
     );
-    expect(isServiceError({ code: "c", subsystem: "ingest", retryable: false })).toBe(true);
   });
 
   it("rejects non-matching values", () => {
@@ -79,7 +84,7 @@ describe("isServiceError", () => {
       { code: "c", subsystem: "nope", retryable: true },
       { code: 7, subsystem: "ingest", retryable: true },
       { code: "c", subsystem: "ingest", retryable: "yes" },
-      { code: "c", subsystem: "ingest", retryable: false, cause: 3 },
+      { code: "c", subsystem: "ingest", retryable: false, detail: 3 },
     ];
     for (const value of bad) {
       expect(isServiceError(value)).toBe(false);
@@ -93,19 +98,44 @@ describe("wrapError", () => {
       code: "ECONNREFUSED",
     });
 
-    const err = wrapError(thrown, "metrics", METRICS_UPSTREAM, true);
+    const err = wrapError(thrown, {
+      subsystem: "metrics",
+      code: METRICS_UPSTREAM,
+      retryable: true,
+    });
 
     expect(isServiceError(err)).toBe(true);
     expect(err.code).toBe("metrics_upstream");
     expect(err.subsystem).toBe("metrics");
     expect(err.retryable).toBe(true);
-    expect(err.cause).toContain("ECONNREFUSED");
+    expect(err.detail).toContain("ECONNREFUSED");
+  });
+
+  it("chains the original error on native .cause, keeping structured fields inspectable", () => {
+    const upstream = Object.assign(new Error("upstream HTTP 503"), { status: 503 });
+
+    const err = wrapError(upstream, {
+      subsystem: "metrics",
+      code: METRICS_UPSTREAM,
+      retryable: true,
+    });
+
+    expect(err.cause).toBe(upstream); // the structured original, not a flattened string
+    expect((err.cause as { status?: number }).status).toBe(503);
+    expect(err.detail).toBe("upstream HTTP 503"); // serialized summary kept separately
+    expect(err.code).toBe("metrics_upstream");
+    expect(err.subsystem).toBe("metrics");
+    expect(err.retryable).toBe(true);
   });
 
   it("keeps an existing ServiceError's own classification", () => {
     const original = wellKnown(DIGEST_LLM_DOWN, "ollama refused");
 
-    const wrapped = wrapError(original, "http", HTTP_BAD_REQUEST, false);
+    const wrapped = wrapError(original, {
+      subsystem: "http",
+      code: HTTP_BAD_REQUEST,
+      retryable: false,
+    });
 
     expect(wrapped).toBe(original);
     expect(wrapped.code).toBe("digest_llm_down");
@@ -114,22 +144,39 @@ describe("wrapError", () => {
   });
 
   it("normalizes a foreign shape-matching object into a real ServiceError", () => {
-    const foreign = { code: "x", subsystem: "scheduler", retryable: false, cause: "cron" };
+    const foreign = { code: "x", subsystem: "scheduler", retryable: false, detail: "cron" };
 
-    const wrapped = wrapError(foreign, "http", HTTP_BAD_REQUEST, false);
+    const wrapped = wrapError(foreign, {
+      subsystem: "http",
+      code: HTTP_BAD_REQUEST,
+      retryable: false,
+    });
 
     expect(wrapped).toBeInstanceOf(ServiceError);
     expect(wrapped.code).toBe("x");
     expect(wrapped.subsystem).toBe("scheduler");
     expect(wrapped.retryable).toBe(false);
-    expect(wrapped.cause).toBe("cron");
+    expect(wrapped.detail).toBe("cron");
+    expect(wrapped.cause).toBe(foreign); // observed object preserved on native .cause
   });
 
-  it("stringifies non-Error throws into cause", () => {
-    expect(wrapError("kaboom", "http", HTTP_BAD_REQUEST, false).cause).toBe("kaboom");
-    expect(wrapError({ weird: true }, "metrics", METRICS_UPSTREAM, true).cause).toBe(
-      "[object Object]",
-    );
+  it("stringifies non-Error throws into detail and preserves them on .cause", () => {
+    const fromString = wrapError("kaboom", {
+      subsystem: "http",
+      code: HTTP_BAD_REQUEST,
+      retryable: false,
+    });
+    expect(fromString.detail).toBe("kaboom");
+    expect(fromString.cause).toBe("kaboom");
+
+    const weird = { weird: true };
+    const fromObject = wrapError(weird, {
+      subsystem: "metrics",
+      code: METRICS_UPSTREAM,
+      retryable: true,
+    });
+    expect(fromObject.detail).toBe("[object Object]");
+    expect(fromObject.cause).toBe(weird);
   });
 });
 

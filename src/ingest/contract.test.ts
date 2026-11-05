@@ -7,8 +7,14 @@ import {
   checkMountHealth,
   DEFAULT_INGEST_SOURCES,
   EXPECTED_SUBDIRS,
+  INGEST_GRANULARITY,
   type IngestResult,
   type IngestSource,
+  PARSER_NAMES,
+  type ParseContext,
+  type ParseOutcome,
+  type ParserName,
+  type SourceParser,
 } from "./contract.js";
 
 const tmpRoots: string[] = [];
@@ -115,6 +121,47 @@ describe("checkMountHealth", () => {
     expect(isServiceError(e)).toBe(true);
     expect((e as ServiceError).code).toBe(INGEST_UNMOUNTED);
   });
+
+  it("requireMount fails on a plain directory that is not a real mount point", async () => {
+    const root = await makeHealthyRoot(); // leftover dir tree, same device as its parent
+
+    const e = await catchThrown(checkMountHealth(root, { requireMount: true }));
+
+    expect(isServiceError(e)).toBe(true);
+    const err = e as ServiceError;
+    expect(err.code).toBe(INGEST_UNMOUNTED);
+    expect(err.subsystem).toBe("ingest");
+    expect(err.retryable).toBe(false);
+  });
+
+  it("sentinel fails closed when the marker file is absent under root", async () => {
+    const root = await makeHealthyRoot(); // tree present, but no sentinel written
+
+    const e = await catchThrown(checkMountHealth(root, { sentinel: ".mounted" }));
+
+    expect(isServiceError(e)).toBe(true);
+    const err = e as ServiceError;
+    expect(err.code).toBe(INGEST_UNMOUNTED);
+    expect(err.subsystem).toBe("ingest");
+    expect(err.retryable).toBe(false);
+  });
+
+  it("sentinel fails closed when the marker exists but is a directory", async () => {
+    const root = await makeHealthyRoot();
+    await mkdir(join(root, ".mounted"));
+
+    const e = await catchThrown(checkMountHealth(root, { sentinel: ".mounted" }));
+
+    expect(isServiceError(e)).toBe(true);
+    expect((e as ServiceError).code).toBe(INGEST_UNMOUNTED);
+  });
+
+  it("sentinel present under root passes", async () => {
+    const root = await makeHealthyRoot();
+    await writeFile(join(root, ".mounted"), "n8n-state-volume");
+
+    await expect(checkMountHealth(root, { sentinel: ".mounted" })).resolves.toEqual({ ok: true });
+  });
 });
 
 describe("IngestSource contract", () => {
@@ -131,7 +178,7 @@ describe("IngestSource contract", () => {
   });
 
   it("a parser ref can be a registry name or a function", () => {
-    const byName: IngestSource = { kind: "drafts", path: "state/drafts", parser: "drafts" };
+    const byName: IngestSource = { kind: "drafts", path: "state/drafts", parser: "n8n-drafts" };
     const byFn: IngestSource = {
       kind: "queue",
       path: "queue/publish",
@@ -143,12 +190,55 @@ describe("IngestSource contract", () => {
       expect.unreachable();
     }
     const partial = byFn.parser("ext-42", {
-      source: "queue",
-      file: "queue/publish/1.json",
-      line: 3,
+      kind: "queue",
+      path: "queue/publish/1.json",
+      line_no: 3,
     });
-    expect(partial.external_id).toBe("ext-42");
-    expect(partial.source_kind).toBe("n8n");
+    expect(partial?.external_id).toBe("ext-42");
+    expect(partial?.source_kind).toBe("n8n");
+  });
+
+  it("default sources use only registered parser names", () => {
+    for (const source of DEFAULT_INGEST_SOURCES) {
+      if (typeof source.parser !== "string") {
+        expect.unreachable();
+      }
+      const name: ParserName = source.parser;
+      expect(PARSER_NAMES).toContain(name);
+    }
+    expect(PARSER_NAMES).toEqual(["n8n-drafts", "n8n-queue", "n8n-publish-log"]);
+  });
+
+  it("INGEST_GRANULARITY fixes per-kind record granularity: files, JSONL for publish_log", () => {
+    expect(INGEST_GRANULARITY).toEqual({ drafts: "file", queue: "file", publish_log: "line" });
+  });
+});
+
+describe("SourceParser boundary", () => {
+  const ctx: ParseContext = { kind: "publish_log", path: "logs/publish.jsonl", line_no: 7 };
+
+  it("returning null means 'unparseable, count as skipped'", () => {
+    const parser: SourceParser = () => null;
+
+    const outcome: ParseOutcome = parser("garbage line", ctx);
+
+    expect(outcome).toBeNull();
+  });
+
+  it("returning a sparse partial is a legal ParseOutcome", () => {
+    const parser: SourceParser = (raw) => ({ external_id: raw });
+
+    const outcome = parser("ext-1", { kind: "drafts", path: "state/drafts/1.json" });
+
+    expect(outcome?.external_id).toBe("ext-1");
+  });
+
+  it("a THROW propagates to the ingester, which turns it into a warning + skipped", () => {
+    const parser: SourceParser = () => {
+      throw new Error("bad record");
+    };
+
+    expect(() => parser("garbage line", ctx)).toThrow("bad record");
   });
 
   it("IngestResult carries items, skipped and warnings", () => {
