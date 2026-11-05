@@ -1,0 +1,76 @@
+# pr_manager - minimal compose snippet (roadmap item_09).
+#
+# Follows the shared_person stack conventions (shared_person/code/
+# docker-compose.yml): the stack runs on a local rootless docker
+# (single-uid userns) and every service uses `network_mode: host`,
+# so this service keeps its hard-coded 127.0.0.1 bind and reaches the
+# sibling services (llm-gateway :8787, n8n webhooks :5780) over the
+# host loopback. The shared_person stack runs n8n on N8N_PORT=5780, so
+# the app's :5678 N8N_WEBHOOK_BASE default must be overridden - see
+# `environment:` below. Under network_mode: host the `ports:` mapping
+# below is IGNORED by compose - it is kept only for a non-host-network
+# deployment; the app already binds 127.0.0.1 itself.
+#
+# Build convention: `npm ci` + `npm run build` run on the HOST and the
+# image COPYs node_modules/ + dist/ only (see
+# shared_person/code/rss-reader/Dockerfile). `build: ..` therefore
+# expects a Dockerfile at the repo root in that shape - the repo does
+# not have one yet, so `docker compose build` fails until it lands.
+#
+# Secrets (VK_TOKEN, TG_BOT_TOKEN, TG_CHAT_ID, WEBHOOK_SECRET),
+# LLM_GATEWAY_URL/CONTENT_GEN_WEBHOOK_URL overrides and TICK_* tuning
+# go into pr_manager.env next to this file - it is in .gitignore via
+# *.env and must never be committed. CONTENT_GEN_WEBHOOK_URL normally
+# stays unset: the send target derives from N8N_WEBHOOK_BASE (pinned
+# below) - set it only to override the full webhook URL outright.
+
+name: pr-manager
+
+volumes:
+  # The shared_person n8n state volume (state/drafts, queue/publish,
+  # logs/*.jsonl) - read-only by contract, the ingester must never
+  # write into it. Named shared-person_n8n_storage on this host
+  # because the parent stack runs under `name: shared-person`.
+  n8n_storage:
+    external: true
+    name: shared-person_n8n_storage
+  pr_manager_data:
+
+services:
+  pr_manager:
+    build: ..
+    image: pr-manager:latest
+    container_name: pr-manager
+    restart: always
+    # rootless-docker convention like the parent stack: host loopback
+    # is shared, so PORT=8789 + the built-in 127.0.0.1 bind already
+    # confine the API to localhost.
+    network_mode: host
+    user: "0"
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      # Inert under network_mode: host (see header); only takes effect
+      # if the service is moved onto a compose network.
+      - "127.0.0.1:8789:8789"
+    env_file:
+      - pr_manager.env
+    environment:
+      - PORT=8789
+      # Mount root the ingester checks fail-closed; the volume layout
+      # (state/, queue/, logs/) is what DEFAULT_INGEST_SOURCES expects.
+      - N8N_STATE_ROOT=/state
+      # The mounted volume really is a mount point inside the
+      # container, so the device check catches an empty/unmounted root.
+      - N8N_STATE_REQUIRE_MOUNT=1
+      - DB_PATH=/data/pr_manager.db
+      - BRAND_CHARTER_PATH=/app/brand.yaml
+      # The sibling stack runs n8n on N8N_PORT=5780; the in-app
+      # N8N_WEBHOOK_BASE default (http://127.0.0.1:5678) would send
+      # Send-to-Pipeline posts to a dead port here.
+      - N8N_WEBHOOK_BASE=http://127.0.0.1:5780
+    volumes:
+      - n8n_storage:/state:ro
+      - pr_manager_data:/data
+      # BrandCharter consumed at digest-tick time (cadence flags).
+      - ../brand.yaml:/app/brand.yaml:ro
