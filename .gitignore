@@ -1,0 +1,18 @@
+# Harness/agent layer (not published)
+.devin/
+.windsurfrules
+
+# Secrets
+.env
+*.env
+ENV
+*.pem
+*.key
+*token*
+
+# Build artifacts
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
