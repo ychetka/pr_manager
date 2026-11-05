@@ -14,6 +14,7 @@ import {
   ENV_STATE_ROOT,
   ENV_TG_BOT_TOKEN,
   ENV_TG_CHAT_ID,
+  ENV_VK_TOKEN,
   loadConfig,
 } from "./config.js";
 
@@ -44,6 +45,13 @@ describe("loadConfig", () => {
   it("rejects a non-numeric or out-of-range PORT", () => {
     expect(() => loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_PORT]: "abc" })).toThrow(/PORT/);
     expect(() => loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_PORT]: "70000" })).toThrow(/PORT/);
+  });
+
+  it("passes VK_TOKEN through as optional vkToken", () => {
+    expect(loadConfig({ [ENV_STATE_ROOT]: "/m" }).vkToken).toBeUndefined();
+    expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  " }).vkToken).toBeUndefined();
+    expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "tok" }).vkToken).toBe("tok");
+    expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  tok  " }).vkToken).toBe("tok");
   });
 
   it("applies digest env vars with defaults and optionals", () => {

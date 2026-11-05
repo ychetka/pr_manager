@@ -14,6 +14,7 @@ export const ENV_DB_PATH = "DB_PATH";
 export const ENV_PORT = "PORT";
 export const ENV_REQUIRE_MOUNT = "N8N_STATE_REQUIRE_MOUNT";
 export const ENV_MOUNT_SENTINEL = "N8N_STATE_SENTINEL";
+export const ENV_VK_TOKEN = "VK_TOKEN";
 export const ENV_LLM_GATEWAY_URL = "LLM_GATEWAY_URL";
 export const ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN";
 export const ENV_TG_CHAT_ID = "TG_CHAT_ID";
@@ -47,6 +48,14 @@ export interface ServiceConfig {
    * exist under the root.
    */
   mountHealth: MountHealthOptions;
+  /**
+   * VK API access token for the metrics collector (env
+   * {@link ENV_VK_TOKEN}). Optional at startup: the collector is its
+   * only consumer and must fail with a clear error when it RUNS
+   * without a token, so loadConfig passes the value through without
+   * requiring it.
+   */
+  vkToken?: string;
   /**
    * llm-gateway base URL (env {@link ENV_LLM_GATEWAY_URL}, default
    * {@link DEFAULT_LLM_GATEWAY_URL}); the digest calls `POST {url}/run`.
@@ -102,6 +111,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     llmGatewayUrl: env[ENV_LLM_GATEWAY_URL]?.trim() || DEFAULT_LLM_GATEWAY_URL,
     n8nWebhookBase: env[ENV_N8N_WEBHOOK_BASE]?.trim() || DEFAULT_N8N_WEBHOOK_BASE,
   };
+  const vkToken = env[ENV_VK_TOKEN];
+  if (vkToken !== undefined && vkToken.trim() !== "") {
+    cfg.vkToken = vkToken.trim();
+  }
   const tgBotToken = env[ENV_TG_BOT_TOKEN];
   if (tgBotToken !== undefined && tgBotToken.trim() !== "") {
     cfg.tgBotToken = tgBotToken.trim();
