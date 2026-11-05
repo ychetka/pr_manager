@@ -59,13 +59,18 @@ export class UnknownPlatform extends Error {
   }
 }
 
-/** Thrown by {@link transitionStatus} on a move the state machine forbids. */
+/**
+ * Thrown on a status move a state machine forbids: by
+ * {@link transitionStatus} for content items, and by
+ * StateStore.updateRecommendationStatus / a store-side upsert regression
+ * guard for recommendations and content items (see src/store/contract.ts).
+ */
 export class InvalidTransition extends Error {
   readonly code = "INVALID_TRANSITION" as const;
 
   constructor(
-    readonly from: ContentStatus,
-    readonly to: ContentStatus,
+    readonly from: ContentStatus | RecommendationStatus,
+    readonly to: ContentStatus | RecommendationStatus,
   ) {
     super(`invalid transition: ${from} -> ${to}`);
     this.name = "InvalidTransition";
@@ -84,8 +89,21 @@ export function parsePlatform(s: string): Platform {
   throw new UnknownPlatform(s);
 }
 
-/** ISO 8601 timestamps on a content item. `published_at` is set once an
- * item reaches the "published" status via {@link transitionStatus}. */
+/**
+ * ISO 8601 timestamps on a content item.
+ *
+ * Normalization requirement - applies to EVERY timestamp the model or
+ * store consumes (`ts`, `created_at`, `updated_at`, `published_at`):
+ * values MUST be UTC in the exact form `YYYY-MM-DDTHH:mm:ss.sssZ`, i.e.
+ * the output of `Date.prototype.toISOString()`. Store queries compare
+ * these strings lexicographically (metricsFor ordering and `since`
+ * filtering, latestReport max-ts selection), so offset forms like
+ * `+03:00` would sort and filter incorrectly. Callers must normalize at
+ * write time.
+ *
+ * `published_at` is set once an item reaches the "published" status via
+ * {@link transitionStatus}.
+ */
 export interface ContentTimestamps {
   created_at: string;
   updated_at: string;
@@ -113,11 +131,14 @@ export interface ContentItem {
   timestamps: ContentTimestamps;
 }
 
-/** One measurement of a published item on one platform. `raw` keeps the
+/** One measurement of a published item on one platform. `ts` is a
+ * normalized UTC ISO-8601 timestamp (see {@link ContentTimestamps}) -
+ * metricsFor orders and filters on it lexicographically. `raw` keeps the
  * unmodified upstream payload for debugging and re-derivation. */
 export interface MetricSnapshot {
   item_id: string;
   platform: Platform;
+  /** Normalized UTC ISO-8601, `YYYY-MM-DDTHH:mm:ss.sssZ`. */
   ts: string;
   views?: number;
   likes?: number;
@@ -125,12 +146,23 @@ export interface MetricSnapshot {
   raw?: unknown;
 }
 
-/** Lifecycle of a recommendation emitted by the digest loop. */
+/**
+ * Lifecycle of a recommendation emitted by the digest loop.
+ *
+ * Allowed flow: proposed -> sent -> accepted | dismissed. Only these
+ * three forward edges are legal; "accepted" and "dismissed" are
+ * terminal-ish - no transition may leave them. A same-status write is
+ * an idempotent no-op. Enforced by
+ * StateStore.updateRecommendationStatus (src/store/contract.ts).
+ */
 export type RecommendationStatus = "proposed" | "sent" | "accepted" | "dismissed";
 
-/** A concrete post brief recommended to the developer (digest output). */
+/** A concrete post brief recommended to the developer (digest output).
+ * `ts` is a normalized UTC ISO-8601 timestamp (see
+ * {@link ContentTimestamps}). */
 export interface Recommendation {
   id: string;
+  /** Normalized UTC ISO-8601, `YYYY-MM-DDTHH:mm:ss.sssZ`. */
   ts: string;
   topic: string;
   objective: Objective;
@@ -139,9 +171,12 @@ export interface Recommendation {
 }
 
 /** Result of a profile audit run (item_08-legacy); `findings` are
- * human-readable audit observations for the digest. */
+ * human-readable audit observations for the digest. `ts` is a normalized
+ * UTC ISO-8601 timestamp (see {@link ContentTimestamps}) - the store's
+ * latestReport selects the max `ts` lexicographically. */
 export interface ProfileReport {
   id: string;
+  /** Normalized UTC ISO-8601, `YYYY-MM-DDTHH:mm:ss.sssZ`. */
   ts: string;
   platform: Platform;
   findings: string[];

@@ -125,6 +125,17 @@ describe("transitionStatus", () => {
     expect(transitionStatus(makeItem("measured"), "failed").status).toBe("failed");
   });
 
+  it("writes updated_at/published_at in normalized UTC ISO-8601 form", () => {
+    // Contract requires `YYYY-MM-DDTHH:mm:ss.sssZ` for all timestamps the
+    // store consumes; toISOString() normalizes any input instant to it.
+    const when = new Date("2026-02-01T15:30:00+03:00"); // == 2026-02-01T12:30:00.000Z
+    const next = transitionStatus(makeItem("queued"), "published", when);
+    const isoUtc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    expect(next.timestamps.updated_at).toBe("2026-02-01T12:30:00.000Z");
+    expect(next.timestamps.updated_at).toMatch(isoUtc);
+    expect(next.timestamps.published_at).toMatch(isoUtc);
+  });
+
   it("same-status transition is a documented no-op", () => {
     const item = makeItem("draft");
     expect(transitionStatus(item, "draft")).toBe(item);
