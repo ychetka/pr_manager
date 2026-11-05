@@ -4,6 +4,7 @@ import {
   DEFAULT_LLM_GATEWAY_URL,
   DEFAULT_N8N_WEBHOOK_BASE,
   DEFAULT_PORT,
+  DEFAULT_TICK_STEP_TIMEOUT_MS,
   ENV_CONTENT_GEN_WEBHOOK_URL,
   ENV_DB_PATH,
   ENV_LLM_GATEWAY_URL,
@@ -14,7 +15,9 @@ import {
   ENV_STATE_ROOT,
   ENV_TG_BOT_TOKEN,
   ENV_TG_CHAT_ID,
+  ENV_TICK_STEP_TIMEOUT_MS,
   ENV_VK_TOKEN,
+  ENV_WEBHOOK_SECRET,
   loadConfig,
 } from "./config.js";
 
@@ -75,6 +78,33 @@ describe("loadConfig", () => {
     expect(full.tgChatId).toBe("42");
     expect(full.n8nWebhookBase).toBe("http://n8n:5678");
     expect(full.contentGenWebhookUrl).toBe("http://n8n:5678/webhook/content-gen");
+  });
+
+  it("applies step timeout and webhook secret with defaults and optionals", () => {
+    const cfg = loadConfig({ [ENV_STATE_ROOT]: "/m" });
+    expect(cfg.stepTimeoutMs).toBe(DEFAULT_TICK_STEP_TIMEOUT_MS);
+    expect(cfg.webhookSecret).toBeUndefined();
+
+    const full = loadConfig({
+      [ENV_STATE_ROOT]: "/m",
+      [ENV_TICK_STEP_TIMEOUT_MS]: " 30000 ",
+      [ENV_WEBHOOK_SECRET]: " s3cr3t ",
+    });
+    expect(full.stepTimeoutMs).toBe(30_000);
+    expect(full.webhookSecret).toBe("s3cr3t");
+
+    // Blank secret stays unset (open localhost default); 0 disables the cap.
+    const blank = loadConfig({
+      [ENV_STATE_ROOT]: "/m",
+      [ENV_WEBHOOK_SECRET]: "   ",
+      [ENV_TICK_STEP_TIMEOUT_MS]: "0",
+    });
+    expect(blank.webhookSecret).toBeUndefined();
+    expect(blank.stepTimeoutMs).toBe(0);
+
+    expect(() => loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_TICK_STEP_TIMEOUT_MS]: "abc" })).toThrow(
+      /TICK_STEP_TIMEOUT_MS/,
+    );
   });
 
   it("builds mountHealth options from env", () => {
