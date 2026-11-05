@@ -1,7 +1,7 @@
 # BrandCharter (roadmap item_07) - the personal-brand contract the
 # cadence checker (src/cadence/) compares publish history against.
 # Loaded by src/cadence/charter.ts:loadCharter; the path can be
-# overridden with the BRAND_CHARTER_PATH env var (see src/config.ts).
+# overridden with the BRAND_CHARTER_PATH env var.
 
 audience: >-
   Software developers and engineering leads who follow a

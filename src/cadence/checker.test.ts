@@ -145,6 +145,49 @@ describe("checkCadence", () => {
     expect(result.flags).not.toContain("objective gap: community");
   });
 
+  it("scores items missing published_at by created_at, never by updated_at", () => {
+    const store = memStore();
+    // A measured item created 20d ago but re-ingested an hour ago:
+    // under an updated_at fallback it would enter the window AND mark
+    // vk "fresh", suppressing below cadence. created_at keeps it out.
+    const stale = publishedItem("m-stale", { status: "measured" });
+    stale.timestamps = {
+      created_at: daysAgo(20),
+      updated_at: new Date(FIXED_NOW.getTime() - 60 * 60 * 1000).toISOString(),
+    };
+    store.upsertContentItem(stale);
+    // No published_at but created 2d ago: counted via created_at.
+    const recent = publishedItem("m-recent", { status: "measured" });
+    recent.timestamps = {
+      created_at: daysAgo(2),
+      updated_at: daysAgo(2),
+    };
+    store.upsertContentItem(recent);
+
+    const result = checkCadence(store, makeCharter(), { now: FIXED_NOW });
+
+    expect(result.stats.perPlatform.vk).toBe(1);
+    expect(result.flags).toContain("vk below cadence");
+  });
+
+  it("does not flag pillar imbalance below the minimum sample", () => {
+    const store = memStore();
+    // 3 posts all serving one objective = 100% share, but the sample
+    // is below MIN_IMBALANCE_SAMPLE so no imbalance flag is emitted.
+    for (let i = 1; i <= 3; i++) {
+      store.upsertContentItem(
+        publishedItem(`a${i}`, { objective: "authority", published_at: daysAgo(i + 1) }),
+      );
+    }
+
+    const result = checkCadence(store, makeCharter(), { now: FIXED_NOW });
+
+    expect(result.flags).not.toContain("pillar imbalance: authority");
+    // Gap flags do not depend on the sample size.
+    expect(result.flags).toContain("objective gap: proof");
+    expect(result.flags).toContain("objective gap: community");
+  });
+
   it("ignores posts outside the window and 'measured' items count", () => {
     const store = memStore();
     // Published 20 days ago: outside the 14d window.

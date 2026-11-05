@@ -12,11 +12,18 @@
  */
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import { ENV_BRAND_CHARTER_PATH } from "../config.js";
 import { type Objective, PLATFORMS, type Platform } from "../model/contract.js";
 
-/** Objectives the charter's pillars may map onto (the model union). */
-const OBJECTIVES: readonly Objective[] = ["authority", "proof", "community"];
+/**
+ * Canonical list of the model Objective union. Kept here because
+ * src/model/contract.ts (item_02 scope, outside item_07's may_edit)
+ * exports only the type; the checker imports this single copy so the
+ * union cannot drift between the two cadence files.
+ */
+export const OBJECTIVES: readonly Objective[] = ["authority", "proof", "community"];
+
+/** Env var loadCharter reads when no explicit path argument is given. */
+export const ENV_BRAND_CHARTER_PATH = "BRAND_CHARTER_PATH";
 
 /** Charter path used when neither the arg nor {@link ENV_BRAND_CHARTER_PATH} is set. */
 export const DEFAULT_CHARTER_PATH = "./brand.yaml";
@@ -108,6 +115,7 @@ function parseCadence(v: unknown): PlatformCadence[] {
   if (!Array.isArray(v) || v.length === 0) {
     fail("cadence must be a non-empty list");
   }
+  const seen = new Set<string>();
   return v.map((raw, i): PlatformCadence => {
     const r = asRecord(raw, `cadence[${i}]`);
     const platform = r.platform;
@@ -117,6 +125,10 @@ function parseCadence(v: unknown): PlatformCadence[] {
           `got ${JSON.stringify(platform)}`,
       );
     }
+    if (seen.has(platform)) {
+      fail(`cadence[${i}].platform duplicates an earlier entry: ${JSON.stringify(platform)}`);
+    }
+    seen.add(platform);
     const posts_per_week = requireNumber(r.posts_per_week, `cadence[${i}].posts_per_week`);
     if (posts_per_week < 0) {
       fail(`cadence[${i}].posts_per_week must be >= 0, got ${posts_per_week}`);

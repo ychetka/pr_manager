@@ -3,8 +3,11 @@
  *
  * {@link checkCadence} compares the windowed publish history in the
  * store (items in "published"/"measured" status, scored by
- * `published_at` with `updated_at` as fallback) against the
- * {@link BrandCharter} targets and emits human-readable flags:
+ * `published_at` with `created_at` as fallback - `updated_at` is never
+ * used because it is rewritten on every merge upsert and status
+ * transition, which would let a stale item masquerade as fresh)
+ * against the {@link BrandCharter} targets and emits human-readable
+ * flags:
  *
  * - `"<platform> below cadence"` - windowed posts on the platform fell
  *   below `floor(posts_per_week * window_days / 7)`. Suppressed when a
@@ -12,7 +15,9 @@
  *   (a fresh post means cadence is actively being kept).
  * - `"pillar imbalance: <objective>"` - more than
  *   `thresholds.pillar_imbalance_pct`% of windowed posts share one
- *   objective.
+ *   objective; evaluated only once at least
+ *   {@link MIN_IMBALANCE_SAMPLE} posts fall in the window, so a lone
+ *   post cannot trip a 100%-share flag.
  * - `"objective gap: <objective>"` - zero windowed posts serve a
  *   pillar the charter declares.
  *
@@ -25,13 +30,20 @@
  */
 import { type Objective, PLATFORMS, type Platform } from "../model/contract.js";
 import type { StateStore } from "../store/contract.js";
-import type { BrandCharter } from "./charter.js";
+import { type BrandCharter, OBJECTIVES } from "./charter.js";
 
 /** A post published within this window counts as "fresh" and suppresses below-cadence flags. */
 export const FRESH_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Minimum windowed-post sample before the pillar-imbalance share is
+ * evaluated. Below this, a single post already exceeds any sane share
+ * threshold (1/1 = 100% > 70%), so the flag would be noise stacked on
+ * the cadence/gap flags rather than a signal worth acting on.
+ */
+export const MIN_IMBALANCE_SAMPLE = 4;
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const OBJECTIVES: readonly Objective[] = ["authority", "proof", "community"];
 
 export interface CheckCadenceOptions {
   /** Clock injection for tests; defaults to wall time. */
@@ -54,9 +66,16 @@ export interface CadenceResult {
   stats: CadenceStats;
 }
 
-/** Timestamp an item is scored by: publish time, falling back to last update. */
-function publishTs(item: { timestamps: { published_at?: string; updated_at: string } }): string {
-  return item.timestamps.published_at ?? item.timestamps.updated_at;
+/**
+ * Timestamp an item is scored by: `published_at` when present, else
+ * `created_at` (the immutable upstream creation time). `updated_at` is
+ * deliberately never used: it is rewritten on every merge upsert and
+ * `transitionStatus` move (including published -> measured), so a
+ * weeks-old item re-measured yesterday would enter the window and mark
+ * its platform fresh, suppressing a legitimate below-cadence flag.
+ */
+function publishTs(item: { timestamps: { published_at?: string; created_at: string } }): string {
+  return item.timestamps.published_at ?? item.timestamps.created_at;
 }
 
 /**
@@ -93,7 +112,12 @@ export function checkCadence(
 
   const freshPlatforms = new Set<Platform>();
   for (const item of windowed) {
-    perObjective[item.objective] += 1;
+    // Guard against stored rows whose objective predates/postdates the
+    // model union: counting them would index an uninitialised
+    // perObjective key and yield NaN.
+    if ((OBJECTIVES as readonly string[]).includes(item.objective)) {
+      perObjective[item.objective] += 1;
+    }
     const fresh = now.getTime() - Date.parse(publishTs(item)) <= FRESH_WINDOW_MS;
     for (const p of item.platform_refs) {
       perPlatform[p] += 1;
@@ -113,7 +137,7 @@ export function checkCadence(
   }
 
   const total = windowed.length;
-  if (total > 0) {
+  if (total >= MIN_IMBALANCE_SAMPLE) {
     const top = OBJECTIVES.reduce((a, b) => (perObjective[a] >= perObjective[b] ? a : b));
     if ((perObjective[top] * 100) / total > charter.thresholds.pillar_imbalance_pct) {
       flags.push(`pillar imbalance: ${top}`);

@@ -3,8 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ENV_BRAND_CHARTER_PATH } from "../config.js";
-import { DEFAULT_PILLAR_IMBALANCE_PCT, DEFAULT_WINDOW_DAYS, loadCharter } from "./charter.js";
+import {
+  DEFAULT_PILLAR_IMBALANCE_PCT,
+  DEFAULT_WINDOW_DAYS,
+  ENV_BRAND_CHARTER_PATH,
+  loadCharter,
+} from "./charter.js";
 
 const REPO_CHARTER = fileURLToPath(new URL("../../brand.yaml", import.meta.url));
 
@@ -109,6 +113,11 @@ cadence:
   it("rejects an unknown platform in cadence", () => {
     const path = tmpCharter(MINIMAL.replace("platform: vk", "platform: tiktok"));
     expect(() => loadCharter(path)).toThrowError(/platform/);
+  });
+
+  it("rejects duplicate platforms in cadence", () => {
+    const path = tmpCharter(`${MINIMAL}  - platform: vk\n    posts_per_week: 5\n`);
+    expect(() => loadCharter(path)).toThrowError(/duplicates/);
   });
 
   it("rejects a non-positive window_days and out-of-range threshold", () => {
