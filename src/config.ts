@@ -19,11 +19,13 @@ export const ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN";
 export const ENV_TG_CHAT_ID = "TG_CHAT_ID";
 export const ENV_N8N_WEBHOOK_BASE = "N8N_WEBHOOK_BASE";
 export const ENV_CONTENT_GEN_WEBHOOK_URL = "CONTENT_GEN_WEBHOOK_URL";
+export const ENV_BRAND_CHARTER_PATH = "BRAND_CHARTER_PATH";
 
 export const DEFAULT_DB_PATH = "./data/pr_manager.db";
 export const DEFAULT_PORT = 8789;
 export const DEFAULT_LLM_GATEWAY_URL = "http://127.0.0.1:8787";
 export const DEFAULT_N8N_WEBHOOK_BASE = "http://127.0.0.1:5678";
+export const DEFAULT_BRAND_CHARTER_PATH = "./brand.yaml";
 
 export interface ServiceConfig {
   /**
@@ -69,6 +71,11 @@ export interface ServiceConfig {
   n8nWebhookBase: string;
   /** Full content-gen webhook URL override (env {@link ENV_CONTENT_GEN_WEBHOOK_URL}). */
   contentGenWebhookUrl?: string;
+  /**
+   * BrandCharter file the cadence checker loads (env
+   * {@link ENV_BRAND_CHARTER_PATH}, default {@link DEFAULT_BRAND_CHARTER_PATH}).
+   */
+  brandCharterPath: string;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -101,6 +108,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     mountHealth,
     llmGatewayUrl: env[ENV_LLM_GATEWAY_URL]?.trim() || DEFAULT_LLM_GATEWAY_URL,
     n8nWebhookBase: env[ENV_N8N_WEBHOOK_BASE]?.trim() || DEFAULT_N8N_WEBHOOK_BASE,
+    brandCharterPath: env[ENV_BRAND_CHARTER_PATH]?.trim() || DEFAULT_BRAND_CHARTER_PATH,
   };
   const tgBotToken = env[ENV_TG_BOT_TOKEN];
   if (tgBotToken !== undefined && tgBotToken.trim() !== "") {

@@ -1,0 +1,49 @@
+# BrandCharter (roadmap item_07) - the personal-brand contract the
+# cadence checker (src/cadence/) compares publish history against.
+# Loaded by src/cadence/charter.ts:loadCharter; the path can be
+# overridden with the BRAND_CHARTER_PATH env var (see src/config.ts).
+
+audience: >-
+  Software developers and engineering leads who follow a
+  practitioner's build-in-public journey: people who want concrete,
+  transferable engineering lessons rather than polished marketing.
+
+tone: practitioner, concrete, no fluff
+
+# Content pillars; each maps onto a model Objective
+# (src/model/contract.ts): authority | proof | community.
+content_pillars:
+  - name: Engineering authority
+    objective: authority
+    description: >-
+      Deep technical takes: architecture decisions, trade-offs,
+      postmortems and hard-won lessons from real systems.
+  - name: Proof of work
+    objective: proof
+    description: >-
+      Shipped artifacts and receipts: releases, metrics, demos,
+      benchmarks and before/after results.
+  - name: Community
+    objective: community
+    description: >-
+      Conversation and presence: questions to the audience, replies,
+      OSS shout-outs, behind-the-scenes notes.
+
+# Target cadence per platform; the checker flags a platform when the
+# windowed post count falls below floor(posts_per_week * window/7).
+cadence:
+  - platform: vk
+    posts_per_week: 2
+  - platform: linkedin
+    posts_per_week: 1
+  - platform: facebook
+    posts_per_week: 1
+  - platform: instagram
+    posts_per_week: 1
+
+# Rolling window (days) the checker scores history over.
+window_days: 14
+
+thresholds:
+  # Share of one pillar's posts (%) that triggers a "pillar imbalance" flag.
+  pillar_imbalance_pct: 70
