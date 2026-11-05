@@ -14,6 +14,7 @@ export const ENV_DB_PATH = "DB_PATH";
 export const ENV_PORT = "PORT";
 export const ENV_REQUIRE_MOUNT = "N8N_STATE_REQUIRE_MOUNT";
 export const ENV_MOUNT_SENTINEL = "N8N_STATE_SENTINEL";
+export const ENV_VK_TOKEN = "VK_TOKEN";
 
 export const DEFAULT_DB_PATH = "./data/pr_manager.db";
 export const DEFAULT_PORT = 8789;
@@ -40,6 +41,14 @@ export interface ServiceConfig {
    * exist under the root.
    */
   mountHealth: MountHealthOptions;
+  /**
+   * VK API access token for the metrics collector (env
+   * {@link ENV_VK_TOKEN}). Optional at startup: the collector is its
+   * only consumer and must fail with a clear error when it RUNS
+   * without a token, so loadConfig passes the value through without
+   * requiring it.
+   */
+  vkToken?: string;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -65,10 +74,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     mountHealth.sentinel = env[ENV_MOUNT_SENTINEL];
   }
 
-  return {
+  const cfg: ServiceConfig = {
     stateRoot: requireEnv(env, ENV_STATE_ROOT),
     dbPath: env[ENV_DB_PATH] ?? DEFAULT_DB_PATH,
     port,
     mountHealth,
   };
+  const vkToken = env[ENV_VK_TOKEN];
+  if (vkToken !== undefined && vkToken.trim() !== "") {
+    cfg.vkToken = vkToken;
+  }
+  return cfg;
 }
