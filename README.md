@@ -55,10 +55,13 @@ npm start       # node dist/server.js
 **API-only mode:** `N8N_STATE_ROOT` is the only env the scheduler daemon
 strictly requires. Starting without it does not crash - the HTTP surface still
 serves and `GET /health` answers `ok:true` with `degraded:true` plus a `notice`
-in the scheduler section ("api-only mode: missing required env N8N_STATE_ROOT").
-Manual ticks answer 503 in this mode. A malformed env (bad port, bad tick
-value, unreadable DB path) boots the API in `failed` mode instead:
-`/health` answers `ok:false` and carries the error in the scheduler section -
+in the scheduler section ("api-only mode: missing required env N8N_STATE_ROOT -
+scheduler daemon not started"). Manual ticks answer 503 in this mode. A
+malformed env (bad port, bad tick value, unreadable DB path) boots the API in
+`failed` mode instead - but only once `N8N_STATE_ROOT` is set: the api-only
+check runs first and returns before `loadConfig`, so a malformed env with
+`N8N_STATE_ROOT` absent still yields api-only. In `failed` mode `/health`
+answers `ok:false` and carries the error in the scheduler section -
 local dev without a full env therefore degrades gracefully to API-only.
 
 ## Environment variables
@@ -68,7 +71,7 @@ local dev without a full env therefore degrades gracefully to API-only.
 | `N8N_STATE_ROOT` | - (required for the daemon) | Root of the read-only mounted n8n-state volume; must contain `state/drafts`, `queue/publish`, `logs`. Absent -> api-only mode. |
 | `DB_PATH` | `./data/pr_manager.db` | SQLite file for the StateStore; `:memory:` selects an in-memory DB (tests/dev). |
 | `PORT` | `8789` | HTTP listen port (1..65535; bind stays `127.0.0.1`). |
-| `VK_TOKEN` | unset | VK API access token for the metrics collector. Optional at startup; the metrics tick fails with a clear error when it runs without one. |
+| `VK_TOKEN` | unset | VK API access token for the metrics collector. Optional at startup; without it `collectMetrics` catches the `metrics_auth` error per item - items land in the run's `errored` list (status stays `published`, so the next run retries them) while the metrics tick itself still records `last_success` (nothing is collected). With zero measurable items a missing token surfaces only as silence - check `/health` `metrics.last_success` plus per-item `errored` entries in a manual `/tick/metrics` result. |
 | `LLM_GATEWAY_URL` | `http://127.0.0.1:8787` | llm-gateway base URL; the digest calls `POST {url}/run` (role `strategist`). |
 | `TG_BOT_TOKEN` | unset | Telegram Bot API token for digest delivery and `answerCallbackQuery`. |
 | `TG_CHAT_ID` | unset | Telegram chat the digest is delivered to. A missing token/chat pair degrades the digest tick to a logged skip, never a startup failure. |

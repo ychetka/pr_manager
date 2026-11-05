@@ -4,9 +4,11 @@
 # docker-compose.yml): the stack runs on a local rootless docker
 # (single-uid userns) and every service uses `network_mode: host`,
 # so this service keeps its hard-coded 127.0.0.1 bind and reaches the
-# sibling services (llm-gateway :8787, n8n webhooks :5678) over the
-# host loopback. Under network_mode: host the `ports:` mapping below
-# is IGNORED by compose - it is kept only for a non-host-network
+# sibling services (llm-gateway :8787, n8n webhooks :5780) over the
+# host loopback. The shared_person stack runs n8n on N8N_PORT=5780, so
+# the app's :5678 N8N_WEBHOOK_BASE default must be overridden - see
+# `environment:` below. Under network_mode: host the `ports:` mapping
+# below is IGNORED by compose - it is kept only for a non-host-network
 # deployment; the app already binds 127.0.0.1 itself.
 #
 # Build convention: `npm ci` + `npm run build` run on the HOST and the
@@ -15,10 +17,12 @@
 # expects a Dockerfile at the repo root in that shape - the repo does
 # not have one yet, so `docker compose build` fails until it lands.
 #
-# Secrets (VK_TOKEN, TG_BOT_TOKEN, TG_CHAT_ID, WEBHOOK_SECRET,
-# CONTENT_GEN_WEBHOOK_URL, LLM_GATEWAY_URL/N8N_WEBHOOK_BASE overrides,
-# TICK_* tuning) go into pr_manager.env next to this file - it is in
-# .gitignore via *.env and must never be committed.
+# Secrets (VK_TOKEN, TG_BOT_TOKEN, TG_CHAT_ID, WEBHOOK_SECRET),
+# LLM_GATEWAY_URL/CONTENT_GEN_WEBHOOK_URL overrides and TICK_* tuning
+# go into pr_manager.env next to this file - it is in .gitignore via
+# *.env and must never be committed. CONTENT_GEN_WEBHOOK_URL normally
+# stays unset: the send target derives from N8N_WEBHOOK_BASE (pinned
+# below) - set it only to override the full webhook URL outright.
 
 name: pr-manager
 
@@ -61,6 +65,10 @@ services:
       - N8N_STATE_REQUIRE_MOUNT=1
       - DB_PATH=/data/pr_manager.db
       - BRAND_CHARTER_PATH=/app/brand.yaml
+      # The sibling stack runs n8n on N8N_PORT=5780; the in-app
+      # N8N_WEBHOOK_BASE default (http://127.0.0.1:5678) would send
+      # Send-to-Pipeline posts to a dead port here.
+      - N8N_WEBHOOK_BASE=http://127.0.0.1:5780
     volumes:
       - n8n_storage:/state:ro
       - pr_manager_data:/data
