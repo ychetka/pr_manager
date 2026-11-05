@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -39,3 +42,5 @@ jobs:
             sleep 1
           done
           curl -sf http://localhost:8789/health | grep -q '"ok":true'
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8789/state/summary)
+          test "$code" -eq 501

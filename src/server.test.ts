@@ -26,3 +26,28 @@ describe("health", () => {
     expect(body.subsystems.ingest).toEqual({ last_success: null, last_error: null });
   });
 });
+
+describe("stubs", () => {
+  it("state summary answers 501 not implemented", async () => {
+    const res = await fetch(`${base}/state/summary`);
+    expect(res.status).toBe(501);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: "not implemented" });
+  });
+
+  it("audit run answers 501 not implemented", async () => {
+    const res = await fetch(`${base}/audit/run`, { method: "POST" });
+    expect(res.status).toBe(501);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: "not implemented" });
+  });
+});
+
+describe("error handling", () => {
+  it("unknown route answers JSON 404", async () => {
+    const res = await fetch(`${base}/no-such-route`);
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: "not found" });
+  });
+});

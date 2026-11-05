@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "description": "AI PR specialist service: content pipeline state, VK metrics, Telegram recommendations, cadence control",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "test": "vitest run"
