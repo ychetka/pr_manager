@@ -1,0 +1,46 @@
+name: unit-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Single job so the required check name stays exactly "unit-tests".
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Boot smoke
+        run: |
+          npm run build
+          node dist/server.js &
+          server=$!
+          trap 'kill $server 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8789/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8789/health | grep -q '"ok":true'
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8789/state/summary)
+          test "$code" -eq 501
