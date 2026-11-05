@@ -3,7 +3,8 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_STATE_ROOT, ENV_TICK_STEP_TIMEOUT_MS } from "./config.js";
 import {
   answerCallbackQuery,
   cadenceAwareFetch,
@@ -11,7 +12,14 @@ import {
   Scheduler,
   type StepName,
 } from "./scheduler.js";
-import { app, attachScheduler } from "./server.js";
+import {
+  app,
+  attachScheduler,
+  bootScheduler,
+  resetStartupDiagnostics,
+  setWebhookSecret,
+  WEBHOOK_SECRET_HEADER,
+} from "./server.js";
 import { SqliteStore } from "./store/sqlite.js";
 
 const NOOP_LOG = () => {};
@@ -168,6 +176,67 @@ describe("Scheduler ticks", () => {
     expect((await first).ok).toBe(true);
     expect(ingestRuns).toBe(1);
     expect(sched.isRunning("ingest")).toBe(false);
+  });
+
+  it("times out a hung step: running clears, last_error records the timeout, the next tick runs", async () => {
+    let calls = 0;
+    const sched = new Scheduler(
+      {},
+      {
+        store,
+        log: NOOP_LOG,
+        stepTimeoutMs: 40,
+        steps: {
+          ingest: async () => {
+            calls += 1;
+            if (calls === 1) {
+              await new Promise(() => {}); // never resolves - the hang
+            }
+            return "recovered";
+          },
+        },
+      },
+    );
+
+    const timedOut = await sched.tick("ingest");
+    expect(timedOut.ok).toBe(false);
+    expect(timedOut.error).toContain("step timeout after 40ms");
+    expect(sched.isRunning("ingest")).toBe(false);
+    expect(sched.stepState("ingest").last_error).toContain("step timeout after 40ms");
+    expect(sched.stepState("ingest").last_success).toBeNull();
+
+    // The hang did not wedge the running guard: the next tick executes.
+    const next = await sched.tick("ingest");
+    expect(next).toMatchObject({ ok: true, step: "ingest", result: "recovered" });
+    expect(calls).toBe(2);
+  });
+
+  it("a timed-out step's late resolution does not overwrite the recorded timeout", async () => {
+    let release!: (value: unknown) => void;
+    const gate = new Promise<unknown>((resolve) => {
+      release = resolve;
+    });
+    const sched = new Scheduler(
+      {},
+      {
+        store,
+        log: NOOP_LOG,
+        stepTimeoutMs: 30,
+        steps: { ingest: () => gate },
+      },
+    );
+
+    const res = await sched.tick("ingest");
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("step timeout");
+
+    // The abandoned step resolves late - the timeout record must stand.
+    release("late-value");
+    await new Promise((r) => setTimeout(r, 10));
+    const state = sched.stepState("ingest");
+    expect(state.last_success).toBeNull();
+    expect(state.last_error).toContain("step timeout after 30ms");
+    expect(state.running).toBe(false);
   });
 
   it("composes cadence flags into the digest sendMessage payload", async () => {
@@ -399,6 +468,14 @@ describe("HTTP wiring", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
+  // Keep the module-level server state from leaking between tests:
+  // webhook secret, startup diagnostics and the attached scheduler.
+  afterEach(() => {
+    setWebhookSecret(undefined);
+    resetStartupDiagnostics();
+    attachScheduler(null);
+  });
+
   it("POST /tick/<step> runs the step and updates /health", async () => {
     const calls = { ingest: 0, metrics: 0, digest: 0 };
     const sched = new Scheduler(
@@ -481,5 +558,92 @@ describe("HTTP wiring", () => {
     expect(body.handled).toBe(true);
     expect(sendToPipeline).toHaveBeenCalledWith(store, "rec-3", undefined);
     expect(answer).toHaveBeenCalledTimes(1);
+  });
+
+  it("webhook secret gate: set -> wrong/missing header 403, correct 200; unset -> open", async () => {
+    const calls = { ingest: 0, metrics: 0, digest: 0 };
+    const sched = new Scheduler(
+      { ingest: 0, metrics: 0, digest: 0 },
+      { store, log: NOOP_LOG, steps: quietSteps(calls) },
+    );
+    attachScheduler(sched);
+    setWebhookSecret("s3cr3t");
+
+    // /tick/<step>: missing and wrong secrets are rejected alike.
+    let res = await fetch(`${base}/tick/ingest`, { method: "POST" });
+    expect(res.status).toBe(403);
+    res = await fetch(`${base}/tick/ingest`, {
+      method: "POST",
+      headers: { [WEBHOOK_SECRET_HEADER]: "wrong" },
+    });
+    expect(res.status).toBe(403);
+    expect(calls.ingest).toBe(0); // the forged trigger never reached the step
+
+    res = await fetch(`${base}/tick/ingest`, {
+      method: "POST",
+      headers: { [WEBHOOK_SECRET_HEADER]: "s3cr3t" },
+    });
+    expect(res.status).toBe(200);
+    expect(calls.ingest).toBe(1);
+
+    // /telegram/callback shares the same gate.
+    const update = JSON.stringify({ update_id: 7, callback_query: { id: "q", data: "x" } });
+    res = await fetch(`${base}/telegram/callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: update,
+    });
+    expect(res.status).toBe(403);
+    res = await fetch(`${base}/telegram/callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [WEBHOOK_SECRET_HEADER]: "s3cr3t" },
+      body: update,
+    });
+    expect(res.status).toBe(200);
+
+    // Secret unset -> the localhost-open default is restored.
+    setWebhookSecret(undefined);
+    res = await fetch(`${base}/tick/ingest`, { method: "POST" });
+    expect(res.status).toBe(200);
+    res = await fetch(`${base}/telegram/callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: update,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("surfaces a startup config failure in /health (ok:false + scheduler.last_error)", async () => {
+    attachScheduler(null);
+    const boot = bootScheduler({
+      [ENV_STATE_ROOT]: "/mnt/n8n",
+      [ENV_TICK_STEP_TIMEOUT_MS]: "not-a-number",
+    });
+    expect(boot.mode).toBe("failed");
+    expect(boot.detail).toContain(ENV_TICK_STEP_TIMEOUT_MS);
+
+    const res = await fetch(`${base}/health`);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.degraded).toBe(true);
+    expect(body.subsystems.scheduler.last_success).toBeNull();
+    expect(body.subsystems.scheduler.last_error).toContain(ENV_TICK_STEP_TIMEOUT_MS);
+    expect(body.subsystems.scheduler.notice).toBeUndefined();
+  });
+
+  it("distinguishes absent env (api-only notice) from a thrown config error", async () => {
+    attachScheduler(null);
+    const boot = bootScheduler({}); // N8N_STATE_ROOT absent -> expected degrade
+    expect(boot.mode).toBe("api_only");
+
+    const res = await fetch(`${base}/health`);
+    const body = await res.json();
+    // A deliberate degrade, not a failure: ok stays true, flagged via
+    // degraded + notice instead of a fake scheduler.last_error.
+    expect(body.ok).toBe(true);
+    expect(body.degraded).toBe(true);
+    expect(body.subsystems.scheduler.last_error).toBeNull();
+    expect(body.subsystems.scheduler.notice).toContain("api-only");
+    expect(body.subsystems.scheduler.notice).toContain(ENV_STATE_ROOT);
   });
 });

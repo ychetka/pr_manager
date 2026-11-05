@@ -23,6 +23,8 @@ export const ENV_CONTENT_GEN_WEBHOOK_URL = "CONTENT_GEN_WEBHOOK_URL";
 export const ENV_TICK_INGEST_MS = "TICK_INGEST_MS";
 export const ENV_TICK_METRICS_MS = "TICK_METRICS_MS";
 export const ENV_TICK_DIGEST_MS = "TICK_DIGEST_MS";
+export const ENV_TICK_STEP_TIMEOUT_MS = "TICK_STEP_TIMEOUT_MS";
+export const ENV_WEBHOOK_SECRET = "WEBHOOK_SECRET";
 
 export const DEFAULT_DB_PATH = "./data/pr_manager.db";
 export const DEFAULT_PORT = 8789;
@@ -31,6 +33,7 @@ export const DEFAULT_N8N_WEBHOOK_BASE = "http://127.0.0.1:5678";
 export const DEFAULT_TICK_INGEST_MS = 5 * 60 * 1000; // 5 min
 export const DEFAULT_TICK_METRICS_MS = 30 * 60 * 1000; // 30 min
 export const DEFAULT_TICK_DIGEST_MS = 24 * 60 * 60 * 1000; // 24 h
+export const DEFAULT_TICK_STEP_TIMEOUT_MS = 10 * 60 * 1000; // 10 min
 
 /**
  * Per-step scheduler tick intervals in ms (roadmap item_08). A step set
@@ -103,6 +106,26 @@ export interface ServiceConfig {
    * of that step; manual `/tick/<step>` triggers stay available.
    */
   tick: TickIntervals;
+  /**
+   * Hard cap on one step's run time in ms (env
+   * {@link ENV_TICK_STEP_TIMEOUT_MS}, default
+   * {@link DEFAULT_TICK_STEP_TIMEOUT_MS}). A step still running past it
+   * is abandoned: the tick records `last_error` "step timeout after
+   * Nms" and the running guard clears, so a hung step can neither skip
+   * later ticks nor hide behind a stale last_success in /health. 0
+   * disables the timeout.
+   */
+  stepTimeoutMs: number;
+  /**
+   * Optional shared secret gating the inbound webhook surface - POST
+   * /telegram/callback and POST /tick/<step> (env
+   * {@link ENV_WEBHOOK_SECRET}). When set, a request must echo it in
+   * the `x-telegram-bot-api-secret-token` header (Telegram's official
+   * webhook secret-token header) or it is rejected with 403; when
+   * unset the endpoints stay open, acceptable only because the service
+   * binds 127.0.0.1.
+   */
+  webhookSecret?: string;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -155,6 +178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
       metrics: parseIntervalMs(env, ENV_TICK_METRICS_MS, DEFAULT_TICK_METRICS_MS),
       digest: parseIntervalMs(env, ENV_TICK_DIGEST_MS, DEFAULT_TICK_DIGEST_MS),
     },
+    stepTimeoutMs: parseIntervalMs(env, ENV_TICK_STEP_TIMEOUT_MS, DEFAULT_TICK_STEP_TIMEOUT_MS),
   };
   const vkToken = env[ENV_VK_TOKEN];
   if (vkToken !== undefined && vkToken.trim() !== "") {
@@ -171,6 +195,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
   const contentGenWebhookUrl = env[ENV_CONTENT_GEN_WEBHOOK_URL];
   if (contentGenWebhookUrl !== undefined && contentGenWebhookUrl.trim() !== "") {
     cfg.contentGenWebhookUrl = contentGenWebhookUrl.trim();
+  }
+  const webhookSecret = env[ENV_WEBHOOK_SECRET];
+  if (webhookSecret !== undefined && webhookSecret.trim() !== "") {
+    cfg.webhookSecret = webhookSecret.trim();
   }
   return cfg;
 }

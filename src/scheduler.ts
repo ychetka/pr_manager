@@ -14,6 +14,15 @@
  * the SAME step are skipped (a `running` guard), so a slow ingest can
  * never pile up on itself; different steps may run concurrently.
  *
+ * Step timeout: every step races against `stepTimeoutMs` (env
+ * TICK_STEP_TIMEOUT_MS, default {@link DEFAULT_STEP_TIMEOUT_MS}). A
+ * step still running past the cap is abandoned - the tick records
+ * `last_error` "step timeout after Nms" and the running guard clears,
+ * so a hang can neither skip every later tick nor hide behind a stale
+ * last_success in /health. A timed-out step that resolves late cannot
+ * overwrite the recorded timeout (the result write is guarded by a
+ * timed-out flag). 0 disables the cap.
+ *
  * The digest step composes cadence flags into delivery: the scheduler
  * runs `checkCadence(store, loadCharter())` and wraps the Telegram
  * fetch so the outgoing sendMessage `text` gets the flags section
@@ -54,6 +63,7 @@ import {
   collectMetrics,
   type MetricsRunResult,
 } from "./metrics/collector.js";
+import { VkCollector } from "./metrics/vk.js";
 import type { StateStore } from "./store/contract.js";
 import {
   DEFAULT_TELEGRAM_TIMEOUT_MS,
@@ -72,6 +82,13 @@ export const STEP_NAMES: readonly StepName[] = ["ingest", "metrics", "digest"];
 export function isStepName(v: string): v is StepName {
   return (STEP_NAMES as readonly string[]).includes(v);
 }
+
+/**
+ * Default hard cap on one step's run time (10 min). Production wiring
+ * overrides it from `ServiceConfig.stepTimeoutMs` (env
+ * TICK_STEP_TIMEOUT_MS); 0 disables the cap.
+ */
+export const DEFAULT_STEP_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Per-subsystem health view surfaced via `GET /health`. Exactly the
@@ -205,7 +222,12 @@ export interface CallbackDeps {
 export interface CallbackHandleResult {
   /** True when the update carried a callback_query (i.e. we owned it). */
   handled: boolean;
-  /** The routed action's success flag (`sendToPipeline.ok`); true for non-action callbacks. */
+  /**
+   * The routed action's success flag (`sendToPipeline.ok`). False when
+   * the action failed AND when the callback_query carried a non-empty
+   * `data` naming an unsupported action; true only when nothing
+   * actionable ran (no callback_query, or an empty `data`).
+   */
   ok: boolean;
   /** Action error detail, when any. */
   error?: string;
@@ -357,6 +379,13 @@ export interface SchedulerDeps {
   /** Timer injection for tests; defaults to the globals. */
   setIntervalFn?: typeof setInterval;
   clearIntervalFn?: typeof clearInterval;
+  /**
+   * Hard cap on one step's run time in ms; defaults to
+   * {@link DEFAULT_STEP_TIMEOUT_MS}. A step still running past it is
+   * abandoned - last_error records "step timeout after Nms" and the
+   * running guard clears. 0 disables the cap.
+   */
+  stepTimeoutMs?: number;
   /** Clock injection for tests; defaults to wall time. */
   now?: () => Date;
   /** Log sink; defaults to console.error. */
@@ -491,8 +520,34 @@ export class Scheduler {
       return { ok: true, step: name, skipped: true };
     }
     state.running = true;
+    const timeoutMs = this.deps.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
+    // A step that outlives stepTimeoutMs is abandoned: the timeout
+    // writes last_error and clears `running` (a hung step must not
+    // skip every later tick invisibly). `timedOut` also guards the
+    // result write - a step that resolves only after the cap must not
+    // overwrite the recorded timeout with a late success.
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const result = await this.steps[name]();
+      const stepPromise = this.steps[name]();
+      const raced =
+        timeoutMs > 0
+          ? Promise.race([
+              stepPromise,
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                  timedOut = true;
+                  reject(new Error(`step timeout after ${timeoutMs}ms`));
+                }, timeoutMs);
+              }),
+            ])
+          : stepPromise;
+      const result = await raced;
+      if (timedOut) {
+        // The timer already fired but the step's settlement won the
+        // race ordering - keep the timeout error, drop the late result.
+        throw new Error(`step timeout after ${timeoutMs}ms`);
+      }
       state.last_success = this.now().toISOString();
       return { ok: true, step: name, result };
     } catch (e) {
@@ -503,6 +558,9 @@ export class Scheduler {
       this.log(`[scheduler] ${name} tick failed: ${error}`);
       return { ok: false, step: name, error };
     } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       state.running = false;
     }
   }
@@ -584,12 +642,17 @@ export function createScheduler(
     store,
     stateRoot: cfg.stateRoot,
     mount: cfg.mountHealth,
+    // The VK token comes from the config layer (ServiceConfig.vkToken),
+    // not from process.env inside collect(); an explicit `token` option
+    // shadows the collector's own env fallback.
+    metrics: { collectors: [new VkCollector({ token: cfg.vkToken })] },
     llm: { gatewayUrl: cfg.llmGatewayUrl },
     telegram: { token: cfg.tgBotToken, chatId: cfg.tgChatId },
     pipeline: {
       webhookBase: cfg.n8nWebhookBase,
       webhookUrl: cfg.contentGenWebhookUrl,
     },
+    stepTimeoutMs: cfg.stepTimeoutMs,
     ...overrides,
   });
 }
