@@ -20,11 +20,28 @@ export const ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN";
 export const ENV_TG_CHAT_ID = "TG_CHAT_ID";
 export const ENV_N8N_WEBHOOK_BASE = "N8N_WEBHOOK_BASE";
 export const ENV_CONTENT_GEN_WEBHOOK_URL = "CONTENT_GEN_WEBHOOK_URL";
+export const ENV_TICK_INGEST_MS = "TICK_INGEST_MS";
+export const ENV_TICK_METRICS_MS = "TICK_METRICS_MS";
+export const ENV_TICK_DIGEST_MS = "TICK_DIGEST_MS";
 
 export const DEFAULT_DB_PATH = "./data/pr_manager.db";
 export const DEFAULT_PORT = 8789;
 export const DEFAULT_LLM_GATEWAY_URL = "http://127.0.0.1:8787";
 export const DEFAULT_N8N_WEBHOOK_BASE = "http://127.0.0.1:5678";
+export const DEFAULT_TICK_INGEST_MS = 5 * 60 * 1000; // 5 min
+export const DEFAULT_TICK_METRICS_MS = 30 * 60 * 1000; // 30 min
+export const DEFAULT_TICK_DIGEST_MS = 24 * 60 * 60 * 1000; // 24 h
+
+/**
+ * Per-step scheduler tick intervals in ms (roadmap item_08). A step set
+ * to 0 is never scheduled automatically but can still be triggered
+ * manually via `POST /tick/<step>`.
+ */
+export interface TickIntervals {
+  ingest: number;
+  metrics: number;
+  digest: number;
+}
 
 export interface ServiceConfig {
   /**
@@ -78,12 +95,35 @@ export interface ServiceConfig {
   n8nWebhookBase: string;
   /** Full content-gen webhook URL override (env {@link ENV_CONTENT_GEN_WEBHOOK_URL}). */
   contentGenWebhookUrl?: string;
+  /**
+   * Scheduler tick intervals per step (env {@link ENV_TICK_INGEST_MS} /
+   * {@link ENV_TICK_METRICS_MS} / {@link ENV_TICK_DIGEST_MS}; defaults
+   * {@link DEFAULT_TICK_INGEST_MS}/{@link DEFAULT_TICK_METRICS_MS}/
+   * {@link DEFAULT_TICK_DIGEST_MS}). 0 disables automatic scheduling
+   * of that step; manual `/tick/<step>` triggers stay available.
+   */
+  tick: TickIntervals;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name];
   if (value === undefined || value.trim() === "") {
     throw new Error(`missing required env var: ${name}`);
+  }
+  return value;
+}
+
+/** Parse a tick-interval env var: unset/blank -> `fallback`; must be an integer >= 0 (0 disables). */
+function parseIntervalMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(
+      `invalid ${name}: ${JSON.stringify(raw)} (expected a non-negative integer ms; 0 disables the step)`,
+    );
   }
   return value;
 }
@@ -110,6 +150,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     mountHealth,
     llmGatewayUrl: env[ENV_LLM_GATEWAY_URL]?.trim() || DEFAULT_LLM_GATEWAY_URL,
     n8nWebhookBase: env[ENV_N8N_WEBHOOK_BASE]?.trim() || DEFAULT_N8N_WEBHOOK_BASE,
+    tick: {
+      ingest: parseIntervalMs(env, ENV_TICK_INGEST_MS, DEFAULT_TICK_INGEST_MS),
+      metrics: parseIntervalMs(env, ENV_TICK_METRICS_MS, DEFAULT_TICK_METRICS_MS),
+      digest: parseIntervalMs(env, ENV_TICK_DIGEST_MS, DEFAULT_TICK_DIGEST_MS),
+    },
   };
   const vkToken = env[ENV_VK_TOKEN];
   if (vkToken !== undefined && vkToken.trim() !== "") {
