@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DB_PATH,
+  DEFAULT_LLM_GATEWAY_URL,
+  DEFAULT_N8N_WEBHOOK_BASE,
   DEFAULT_PORT,
+  ENV_CONTENT_GEN_WEBHOOK_URL,
   ENV_DB_PATH,
+  ENV_LLM_GATEWAY_URL,
   ENV_MOUNT_SENTINEL,
+  ENV_N8N_WEBHOOK_BASE,
   ENV_PORT,
   ENV_REQUIRE_MOUNT,
   ENV_STATE_ROOT,
+  ENV_TG_BOT_TOKEN,
+  ENV_TG_CHAT_ID,
   ENV_VK_TOKEN,
   loadConfig,
 } from "./config.js";
@@ -45,6 +52,29 @@ describe("loadConfig", () => {
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  " }).vkToken).toBeUndefined();
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "tok" }).vkToken).toBe("tok");
     expect(loadConfig({ [ENV_STATE_ROOT]: "/m", [ENV_VK_TOKEN]: "  tok  " }).vkToken).toBe("tok");
+  });
+
+  it("applies digest env vars with defaults and optionals", () => {
+    const cfg = loadConfig({ [ENV_STATE_ROOT]: "/m" });
+    expect(cfg.llmGatewayUrl).toBe(DEFAULT_LLM_GATEWAY_URL);
+    expect(cfg.n8nWebhookBase).toBe(DEFAULT_N8N_WEBHOOK_BASE);
+    expect(cfg.tgBotToken).toBeUndefined();
+    expect(cfg.tgChatId).toBeUndefined();
+    expect(cfg.contentGenWebhookUrl).toBeUndefined();
+
+    const full = loadConfig({
+      [ENV_STATE_ROOT]: "/m",
+      [ENV_LLM_GATEWAY_URL]: "http://gw:9999",
+      [ENV_TG_BOT_TOKEN]: "tok",
+      [ENV_TG_CHAT_ID]: " 42 ",
+      [ENV_N8N_WEBHOOK_BASE]: "http://n8n:5678",
+      [ENV_CONTENT_GEN_WEBHOOK_URL]: "http://n8n:5678/webhook/content-gen",
+    });
+    expect(full.llmGatewayUrl).toBe("http://gw:9999");
+    expect(full.tgBotToken).toBe("tok");
+    expect(full.tgChatId).toBe("42");
+    expect(full.n8nWebhookBase).toBe("http://n8n:5678");
+    expect(full.contentGenWebhookUrl).toBe("http://n8n:5678/webhook/content-gen");
   });
 
   it("builds mountHealth options from env", () => {
